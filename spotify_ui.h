@@ -26,6 +26,7 @@
 #include <lvgl.h>
 #include <JPEGDEC.h>
 #include "spotify_api.h"
+#include "setup_portal.h"
 #include "scr_st77916.h"
 #include "logo_img.h"
 
@@ -88,6 +89,19 @@
 #define BACKLIGHT_FULL        100
 #define BACKLIGHT_DIM         10
 
+#define SETUP_LONG_PRESS_MS   5000    // hold the screen this long to open the setup portal
+#define SETUP_HINT_MS         1800    // ...with a hint after this long
+#define SETUP_QR_SIZE         140
+#define SETUP_QR_Y            16
+#define SETUP_QR_BORDER       6       // quiet zone, so phones can read it off the panel
+#define SETUP_TITLE_Y         176
+#define SETUP_L1_Y            206
+#define SETUP_L2_Y            228
+#define SETUP_L3_Y            252
+#define SETUP_L4_Y            274     // status line
+#define SETUP_TEXT_WIDTH      212
+#define WIFI_FIRST_TIMEOUT_MS 60000   // never connected since boot -> fall back to the setup access point
+
 #define POLL_INTERVAL_MS      3000
 #define POLL_MAX_INTERVAL_MS  30000   // after repeated failures
 #define CMD_SETTLE_MS         500     // re-read state this long after a command
@@ -121,7 +135,13 @@ struct PlayerState {
   // one-shot message
   char     toast[192];
   uint32_t toast_seq;
+  // provisioning
+  bool     setup_mode;      // the setup portal is running: show the setup screen
 };
+
+enum AppMode : uint8_t { MODE_PLAYER = 0, MODE_SETUP };
+static volatile AppMode g_mode = MODE_PLAYER;
+static volatile bool g_setup_requested = false;  // set by the long-press on the screen
 
 enum CmdType : uint8_t { CMD_PLAY = 0, CMD_PAUSE, CMD_NEXT, CMD_PREV };
 struct Cmd {
@@ -754,7 +774,7 @@ static void conn_ladder() {
     api_close();
     WiFi.disconnect();
     delay(300);
-    WiFi.begin(SSID, PASSWORD);
+    WiFi.begin(g_cfg.ssid, g_cfg.pass);
   }
 
 #if CONN_REBOOT_AFTER_MS > 0
@@ -961,18 +981,79 @@ static void log_stats() {
   g_stat_polls = g_stat_poll_ms = g_stat_poll_max = 0;
 }
 
+static void set_setup_flag(bool on) {
+  ps_lock();
+  g_ps.setup_mode = on;
+  ps_unlock();
+}
+
+// Opens the provisioning portal: on the LAN when Wi-Fi works (the phone stays
+// on the home network), otherwise as an access point of our own.
+static void enter_setup(bool force_ap, const char *why) {
+  const bool lan = !force_ap && WiFi.status() == WL_CONNECTED;
+  LOGI("net", "entering setup mode (%s) - portal on %s", why, lan ? "the LAN" : "its own access point");
+  api_close();
+  g_mode = MODE_SETUP;
+  set_setup_flag(true);
+  portal_start(lan ? PORTAL_LAN : PORTAL_AP);
+}
+
+static void leave_setup() {
+  portal_stop();
+  g_mode = MODE_PLAYER;
+  set_setup_flag(false);
+  conn_mark_good();
+  g_poll_failures = 0;
+  g_next_poll = millis();
+  set_idle_text("Connecting", "Spotify");
+  LOGI("net", "setup finished - back to the player");
+}
+
 static void net_task(void *) {
   LOGI("net", "net_task started on core %d", (int)xPortGetCoreID());
   tls_prepare(g_api_tls);
   g_api_http.setReuse(true);
   build_filters();
-  wifi_begin();
+  config_log();
 
-  bool online = false;
+  bool online = false, ever_online = false;
+  const uint32_t boot_ms = millis();
   uint32_t offline_since = millis(), next_wifi_kick = millis() + 20000, next_stats = millis() + STATS_EVERY_MS;
+
+  if (!g_cfg.has_wifi()) {
+    enter_setup(true, "no Wi-Fi credentials stored");
+  } else {
+    wifi_begin();
+    if (!g_cfg.has_client() || !g_cfg.has_token())
+      set_idle_text("Connecting", "Setup continues once online");
+  }
 
   for (;;) {
     const uint32_t now = millis();
+
+    // ---- provisioning ----
+    if (g_setup_requested) {
+      g_setup_requested = false;
+      if (g_mode != MODE_SETUP) enter_setup(false, "requested on the screen");
+    }
+    if (g_mode == MODE_SETUP) {
+      portal_loop();
+      if (g_portal_auth_ok && g_cfg.has_token() && WiFi.status() == WL_CONNECTED) {
+        g_portal_auth_ok = false;
+        leave_setup();
+      } else if (g_cfg.has_wifi() && g_cfg.has_client() && g_cfg.has_token() && WiFi.status() == WL_CONNECTED &&
+                 portal_idle_ms() > PORTAL_IDLE_EXIT_MS) {
+        LOGI("net", "nothing left to set up and the page has been idle - returning to the player");
+        leave_setup();
+      }
+      delay(5);
+      continue;
+    }
+    if (g_needs_reauth) {
+      g_needs_reauth = false;
+      enter_setup(false, "Spotify authorization is missing or was rejected");
+      continue;
+    }
 
     if (WiFi.status() != WL_CONNECTED) {
       conn_mark_bad();
@@ -987,13 +1068,17 @@ static void net_task(void *) {
       if ((int32_t)(now - next_wifi_kick) >= 0) {
         LOGW("wifi", "offline for %lu s, restarting the connection", (unsigned long)((now - offline_since) / 1000));
         WiFi.disconnect();
-        WiFi.begin(SSID, PASSWORD);
+        WiFi.begin(g_cfg.ssid, g_cfg.pass);
         next_wifi_kick = now + 20000;
       }
       Cmd c;
       while (xQueueReceive(g_cmd_q, &c, 0) == pdTRUE) {
         revert_optimistic(c.type);
         notify_user("Offline\nWaiting for Wi-Fi");
+      }
+      if (!ever_online && (now - boot_ms) > WIFI_FIRST_TIMEOUT_MS) {
+        enter_setup(true, "Wi-Fi did not connect since boot - check the credentials");
+        continue;
       }
       conn_ladder();
       delay(100);
@@ -1002,11 +1087,16 @@ static void net_task(void *) {
 
     if (!online) {
       online = true;
+      ever_online = true;
       LOGI("wifi", "connected in %lu ms: IP %s, RSSI %d dBm, channel %d", (unsigned long)(now - offline_since),
            WiFi.localIP().toString().c_str(), (int)WiFi.RSSI(), (int)WiFi.channel());
       log_heap("wifi up");
       set_idle_text("Signing in", "Contacting Spotify");
       g_next_poll = now;
+      if (!g_cfg.has_client() || !g_cfg.has_token()) {
+        enter_setup(false, !g_cfg.has_client() ? "no Spotify app credentials stored" : "not authorized yet");
+        continue;
+      }
     }
 
     service_commands();
@@ -1103,6 +1193,16 @@ static void display_init() {
 // Widgets and UI logic (core 1 only)
 // ============================================================================
 static lv_obj_t *ui_arc, *ui_art, *ui_title, *ui_artist, *ui_time, *ui_prev, *ui_next, *ui_tap, *ui_tap_icon, *ui_toast;
+static lv_obj_t *ui_player_scr = nullptr, *ui_setup_scr = nullptr;
+static lv_obj_t *ui_setup_title, *ui_setup_l1, *ui_setup_l2, *ui_setup_l3, *ui_setup_l4;
+#if LV_USE_QRCODE
+static lv_obj_t *ui_setup_qr = nullptr;
+#endif
+static lv_obj_t *ui_setup_box = nullptr;  // "Open setup?" confirmation
+static uint32_t ui_view_seq = 0;
+static bool     ui_setup_shown = false;
+static uint32_t ui_press_start = 0;
+static bool     ui_press_fired = false, ui_press_hinted = false, ui_ignore_click = false;
 
 static uint32_t ui_tap_until = 0;     // tap feedback expiry, handled by ui_tick()
 static uint32_t ui_toast_until = 0;
@@ -1134,6 +1234,10 @@ static void show_tap_feedback(bool to_play) {
 }
 
 static void on_art_clicked(lv_event_t *) {
+  if (ui_ignore_click) {  // the press that opened the setup dialog must not toggle playback
+    ui_ignore_click = false;
+    return;
+  }
   const uint32_t now = millis();
   bool to_play;
   ps_lock();
@@ -1166,6 +1270,58 @@ static void on_next_clicked(lv_event_t *) {
   send_cmd(CMD_NEXT);
 }
 
+static void setup_box_event(lv_event_t *e) {
+  lv_obj_t *box = lv_event_get_current_target(e);
+  const uint16_t id = lv_msgbox_get_active_btn(box);
+  if (id == 1) {
+    LOGI("ui", "setup requested from the screen");
+    g_setup_requested = true;
+  }
+  lv_msgbox_close(box);
+  ui_setup_box = nullptr;
+}
+
+static void show_setup_confirm() {
+  if (ui_setup_box) return;
+  static const char *btns[] = {"Cancel", "Setup", ""};
+  ui_setup_box = lv_msgbox_create(NULL, "Setup", "Open the setup page\n(Wi-Fi, Spotify account)?", btns, false);
+  lv_obj_set_style_text_font(ui_setup_box, &lv_font_montserrat_16, 0);
+  lv_obj_set_width(ui_setup_box, 236);       // stay inside the round screen
+  lv_obj_update_layout(ui_setup_box);        // size first, then centre
+  lv_obj_center(ui_setup_box);
+  lv_obj_add_event_cb(ui_setup_box, setup_box_event, LV_EVENT_VALUE_CHANGED, NULL);
+}
+
+// Hold anywhere on the player screen to reach the setup portal again.
+static void on_screen_event(lv_event_t *e) {
+  switch (lv_event_get_code(e)) {
+    case LV_EVENT_PRESSED:
+      ui_press_start = millis();
+      ui_press_fired = ui_press_hinted = false;
+      break;
+    case LV_EVENT_PRESSING: {
+      if (!ui_press_start || ui_press_fired) break;
+      const uint32_t held = millis() - ui_press_start;
+      if (!ui_press_hinted && held > SETUP_HINT_MS) {
+        ui_press_hinted = true;
+        notify_user("Keep holding for setup");
+      }
+      if (held > SETUP_LONG_PRESS_MS) {
+        ui_press_fired = true;
+        ui_ignore_click = true;
+        show_setup_confirm();
+      }
+      break;
+    }
+    case LV_EVENT_RELEASED:
+    case LV_EVENT_PRESS_LOST:
+      ui_press_start = 0;
+      break;
+    default:
+      break;
+  }
+}
+
 static lv_obj_t *make_nav_button(lv_obj_t *parent, const char *symbol, int x, lv_event_cb_t cb) {
   lv_obj_t *b = lv_btn_create(parent);
   lv_obj_remove_style_all(b);
@@ -1185,8 +1341,60 @@ static lv_obj_t *make_nav_button(lv_obj_t *parent, const char *symbol, int x, lv
   return b;
 }
 
+// Second screen: what the provisioning portal wants shown.
+static lv_obj_t *make_setup_label(lv_obj_t *parent, const lv_font_t *font, lv_color_t color, int y) {
+  lv_obj_t *l = lv_label_create(parent);
+  lv_obj_set_width(l, SETUP_TEXT_WIDTH);
+  lv_label_set_long_mode(l, LV_LABEL_LONG_SCROLL_CIRCULAR);
+  lv_obj_set_style_text_font(l, font, 0);
+  lv_obj_set_style_text_color(l, color, 0);
+  lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_anim_speed(l, 30, 0);
+  lv_obj_align(l, LV_ALIGN_TOP_MID, 0, y);
+  lv_label_set_text(l, "");
+  return l;
+}
+
+static void ui_build_setup_screen() {
+  ui_setup_scr = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(ui_setup_scr, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(ui_setup_scr, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(ui_setup_scr, LV_OBJ_FLAG_SCROLLABLE);
+#if LV_USE_QRCODE
+  ui_setup_qr = lv_qrcode_create(ui_setup_scr, SETUP_QR_SIZE, lv_color_black(), lv_color_white());
+  lv_obj_align(ui_setup_qr, LV_ALIGN_TOP_MID, 0, SETUP_QR_Y);
+  lv_obj_set_style_border_color(ui_setup_qr, lv_color_white(), 0);
+  lv_obj_set_style_border_width(ui_setup_qr, SETUP_QR_BORDER, 0);
+  lv_obj_add_flag(ui_setup_qr, LV_OBJ_FLAG_HIDDEN);
+#endif
+  ui_setup_title = make_setup_label(ui_setup_scr, &lv_font_montserrat_22, lv_color_white(), SETUP_TITLE_Y);
+  ui_setup_l1 = make_setup_label(ui_setup_scr, &lv_font_montserrat_16, lv_color_hex(COLOR_TEXT_GREY), SETUP_L1_Y);
+  ui_setup_l2 = make_setup_label(ui_setup_scr, &lv_font_montserrat_16, lv_color_white(), SETUP_L2_Y);
+  ui_setup_l3 = make_setup_label(ui_setup_scr, &lv_font_montserrat_14, lv_color_white(), SETUP_L3_Y);
+  ui_setup_l4 = make_setup_label(ui_setup_scr, &lv_font_montserrat_14, lv_color_hex(COLOR_SPOTIFY_GREEN), SETUP_L4_Y);
+}
+
+static void ui_apply_setup_view() {
+  SetupView v;
+  view_get(v);
+  if (v.seq == ui_view_seq) return;
+  ui_view_seq = v.seq;
+  lv_label_set_text(ui_setup_title, v.title);
+  lv_label_set_text(ui_setup_l1, v.line1);
+  lv_label_set_text(ui_setup_l2, v.line2);
+  lv_label_set_text(ui_setup_l3, v.line3);
+  lv_label_set_text(ui_setup_l4, v.line4);
+#if LV_USE_QRCODE
+  if (v.qr[0] && lv_qrcode_update(ui_setup_qr, v.qr, strlen(v.qr)) == LV_RES_OK)
+    lv_obj_clear_flag(ui_setup_qr, LV_OBJ_FLAG_HIDDEN);
+  else
+    lv_obj_add_flag(ui_setup_qr, LV_OBJ_FLAG_HIDDEN);
+#endif
+}
+
 static void ui_build() {
   lv_obj_t *scr = lv_scr_act();
+  ui_player_scr = scr;
   lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
   lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
@@ -1281,6 +1489,13 @@ static void ui_build() {
   lv_obj_align(ui_toast, LV_ALIGN_CENTER, 0, ART_CENTER_OFS_Y);
   lv_label_set_text(ui_toast, "");
   lv_obj_add_flag(ui_toast, LV_OBJ_FLAG_HIDDEN);
+
+  // Long press anywhere (the artwork bubbles its presses up) opens setup.
+  lv_obj_add_flag(ui_art, LV_OBJ_FLAG_EVENT_BUBBLE);
+  lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(scr, on_screen_event, LV_EVENT_ALL, NULL);
+
+  ui_build_setup_screen();
 }
 
 // Every 100 ms on core 1: shared state -> widgets.
@@ -1290,6 +1505,26 @@ static void ui_tick(lv_timer_t *) {
   ps_lock();
   s = g_ps;
   ps_unlock();
+
+  // 0. Provisioning screen takes over while the setup portal is running
+  if (s.setup_mode != ui_setup_shown) {
+    ui_setup_shown = s.setup_mode;
+    ui_view_seq = 0;  // force a refresh of the setup labels
+    if (ui_setup_box) {
+      lv_msgbox_close(ui_setup_box);
+      ui_setup_box = nullptr;
+    }
+    lv_scr_load(ui_setup_shown ? ui_setup_scr : ui_player_scr);
+    LOGI("ui", "%s screen", ui_setup_shown ? "setup" : "player");
+  }
+  if (ui_setup_shown) {
+    ui_apply_setup_view();
+    if (ui_backlight != BACKLIGHT_FULL) {  // keep it readable while someone is setting it up
+      ui_backlight = BACKLIGHT_FULL;
+      set_brightness(BACKLIGHT_FULL);
+    }
+    return;
+  }
 
   // 1. Artwork hand-off: the only place g_art_buf is written.
   bool art_changed = false;
@@ -1398,12 +1633,13 @@ static void fatal_halt(const char *msg) {
 static void ui_init() {
   if (xPortGetCoreID() != 1) LOGW("ui", "setup() is on core %d - set Tools > Arduino Runs On: Core 1", (int)xPortGetCoreID());
   if (!psramFound()) fatal_halt("PSRAM not found (Tools > PSRAM)");
+  config_load();  // Wi-Fi and Spotify credentials from NVS (see app_config.h)
 
   g_ps_mtx = xSemaphoreCreateMutex();
   g_cmd_q = xQueueCreate(8, sizeof(Cmd));
   memset(&g_ps, 0, sizeof(g_ps));
   strlcpy(g_ps.idle_title, "Connecting", sizeof(g_ps.idle_title));
-  snprintf(g_ps.idle_detail, sizeof(g_ps.idle_detail), "Wi-Fi: %s", SSID);
+  snprintf(g_ps.idle_detail, sizeof(g_ps.idle_detail), "%s", g_cfg.has_wifi() ? g_cfg.ssid : "Starting setup");
 
   g_art_buf = (uint16_t *)heap_caps_calloc(1, ART_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   g_stage_buf = (uint16_t *)heap_caps_calloc(1, ART_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);

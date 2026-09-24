@@ -91,9 +91,15 @@ static void app_log(char level, const char *tag, const char *fmt, ...) {
 // ============================================================================
 // Configuration
 // ============================================================================
+#include "app_config.h"  // credentials in NVS; needs the logging macros above
+
 #define SPOTIFY_API_BASE        "https://api.spotify.com/v1"
 #define SPOTIFY_TOKEN_URL       "https://accounts.spotify.com/api/token"
 #define SPOTIFY_REQUIRED_SCOPES "user-read-playback-state user-modify-playback-state user-read-currently-playing"
+// Registered in the Spotify dashboard. Loopback is the only http:// form Spotify
+// accepts; the browser cannot reach it, which is why the setup page asks for the
+// redirected address to be pasted back.
+#define SPOTIFY_REDIRECT_URI    "http://127.0.0.1:8888/callback"
 
 // Optional ISO 3166-1 alpha-2 code sent as `market` on GET /me/player (e.g. "FR").
 // Empty = parameter omitted. The account's own country takes priority anyway.
@@ -282,6 +288,10 @@ static void net_diag_dump(const char *why) {
 // Wi-Fi
 // ============================================================================
 static void wifi_begin() {
+  if (!g_cfg.has_wifi()) {
+    LOGW("wifi", "no Wi-Fi credentials stored");
+    return;
+  }
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
     if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED)
       LOGW("wifi", "disconnected, reason %u", (unsigned)info.wifi_sta_disconnected.reason);
@@ -292,8 +302,8 @@ static void wifi_begin() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);        // modem sleep adds 100+ ms to every request
   WiFi.setAutoReconnect(true);
-  LOGI("wifi", "connecting to \"%s\"", SSID);
-  WiFi.begin(SSID, PASSWORD);
+  LOGI("wifi", "connecting to \"%s\"", g_cfg.ssid);
+  WiFi.begin(g_cfg.ssid, g_cfg.pass);
 }
 
 // ============================================================================
@@ -308,8 +318,8 @@ static uint32_t g_token_deadline = 0;       // millis() at which we renew (expir
 static uint32_t g_token_retry_at = 0;       // no refresh attempts before this millis()
 static uint32_t g_token_backoff_ms = 0;
 static bool     g_token_rejected = false;   // Spotify said the refresh token / client is invalid
+static bool     g_needs_reauth = false;     // -> the setup portal must run the authorization again
 static char     g_token_error[160] = "";    // last token failure, human readable
-static String   g_refresh_token = REFRESH_TOKEN;
 
 static uint32_t g_api_session_at = 0;       // millis() when the current keep-alive session was opened
 static uint32_t g_backoff_until = 0;        // 429 / 5xx: no API traffic before this millis()
@@ -397,6 +407,12 @@ static void extract_error_message(const String &body, char *out, size_t n) {
 // ============================================================================
 static bool refresh_access_token() {
   const uint32_t t0 = millis();
+  if (!g_cfg.has_client() || !g_cfg.has_token()) {
+    snprintf(g_token_error, sizeof(g_token_error), "Not authorized yet - open the setup page");
+    g_needs_reauth = true;
+    g_token_valid = false;
+    return false;
+  }
   LOGI("auth", "refreshing access token");
   tls_heap_ok("token refresh");
 
@@ -413,9 +429,9 @@ static bool refresh_access_token() {
   }
   const char *hdrs[] = {"Retry-After"};
   http.collectHeaders(hdrs, 1);
-  http.addHeader("Authorization", "Basic " AUTH_B64);   // precomputed base64(client_id:client_secret)
+  http.addHeader("Authorization", String("Basic ") + g_cfg.auth_b64);  // base64(client_id:client_secret), made at save time
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  const String form = "grant_type=refresh_token&refresh_token=" + url_encode(g_refresh_token);
+  const String form = String("grant_type=refresh_token&refresh_token=") + url_encode(g_cfg.refresh_token);
   const int code = http.POST(form);
   String body = (code > 0 && code != 204) ? http.getString() : String();
   const uint32_t retry_after = (uint32_t)http.header("Retry-After").toInt();
@@ -444,10 +460,9 @@ static bool refresh_access_token() {
         if (!strstr(scope, s)) LOGW("auth", "token is missing scope '%s' - re-run the PC helper", s);
 
       const char *new_rt = doc["refresh_token"] | "";
-      if (*new_rt && g_refresh_token != new_rt) {
-        g_refresh_token = new_rt;  // Spotify rotated it: keep using the new one until reboot
-        LOGW("auth", "Spotify returned a new refresh token (%.8s...). Using it until reboot; if the old one stops "
-                     "working, run the PC helper again and update secrets.h.", new_rt);
+      if (*new_rt && strcmp(new_rt, g_cfg.refresh_token) != 0) {
+        config_save_token(new_rt);  // Spotify rotated it: keep the new one across reboots
+        LOGW("auth", "Spotify issued a new refresh token (%.8s...) - stored", new_rt);
       }
       return true;
     }
@@ -462,10 +477,14 @@ static bool refresh_access_token() {
       snprintf(g_token_error, sizeof(g_token_error), "%s", *msg ? msg : "credentials rejected");
       g_token_retry_at = millis() + TOKEN_REJECTED_RETRY_MS;
       LOGE("auth", "token refresh rejected (HTTP %d): %s", code, g_token_error);
-      if (strstr(msg, "invalid_grant"))
-        LOGE("auth", "-> refresh token expired or revoked: run extras/get_refresh_token.py and update secrets.h");
-      else if (strstr(msg, "invalid_client"))
-        LOGE("auth", "-> client id/secret rejected: check AUTH_B64 in secrets.h");
+      if (strstr(msg, "invalid_grant")) {
+        LOGE("auth", "-> the refresh token expired (6 months), was revoked, or the app changed");
+        config_clear_token();  // makes the board open its setup page and ask for a new authorization
+        g_needs_reauth = true;
+      } else if (strstr(msg, "invalid_client")) {
+        LOGE("auth", "-> client id/secret rejected: re-enter them on the setup page");
+        g_needs_reauth = true;
+      }
       g_token_valid = false;
       return false;
     }
@@ -502,6 +521,81 @@ static bool ensure_access_token() {
   g_token_valid = false;
   if ((int32_t)(millis() - g_token_retry_at) < 0) return false;
   return refresh_access_token();
+}
+
+// Exchanges the authorization code from the pasted redirect address for a
+// refresh token and stores it. Runs once, during setup.
+static bool spotify_exchange_code(const char *code, char *err, size_t errn) {
+  err[0] = 0;
+  if (!g_cfg.has_client()) {
+    snprintf(err, errn, "No client ID and secret stored yet");
+    return false;
+  }
+  tls_heap_ok("code exchange");
+  WiFiClientSecure tls;
+  tls_prepare(tls);
+  HTTPClient http;
+  http.setReuse(false);
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  http.setConnectTimeout(HTTP_TIMEOUT_MS);
+  if (!http.begin(tls, SPOTIFY_TOKEN_URL)) {
+    snprintf(err, errn, "Could not contact accounts.spotify.com");
+    return false;
+  }
+  http.addHeader("Authorization", String("Basic ") + g_cfg.auth_b64);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  String form = String("grant_type=authorization_code&code=") + url_encode(code) + "&redirect_uri=" +
+                url_encode(SPOTIFY_REDIRECT_URI);
+  const uint32_t t0 = millis();
+  const int status = http.POST(form);
+  form = String();
+  String body = (status > 0 && status != 204) ? http.getString() : String();
+  http.end();
+  tls.stop();
+
+  if (status == 200 && body_is_json(body)) {
+    JsonDocument doc(&g_json_alloc);
+    const DeserializationError e = deserializeJson(doc, body);
+    const char *refresh = doc["refresh_token"] | "";
+    const char *access = doc["access_token"] | "";
+    const uint32_t expires_in = doc["expires_in"] | 3600;
+    if (!e && *refresh && strlen(refresh) < sizeof(g_cfg.refresh_token)) {
+      config_save_token(refresh);
+      if (*access && strlen(access) < sizeof(g_access_token)) {  // usable straight away
+        strlcpy(g_access_token, access, sizeof(g_access_token));
+        g_token_deadline = millis() + (expires_in > 2 * TOKEN_EARLY_REFRESH_S ? expires_in - TOKEN_EARLY_REFRESH_S
+                                                                             : expires_in / 2) * 1000UL;
+        g_token_valid = true;
+      }
+      g_token_rejected = false;
+      g_needs_reauth = false;
+      g_token_retry_at = 0;
+      g_token_error[0] = 0;
+      const char *scope = doc["scope"] | "";
+      const char *needed[] = {"user-read-playback-state", "user-modify-playback-state", "user-read-currently-playing"};
+      for (const char *sc : needed)
+        if (!strstr(scope, sc)) LOGW("auth", "the granted scopes are missing '%s'", sc);
+      LOGI("auth", "authorization complete in %lu ms; refresh token stored", (unsigned long)(millis() - t0));
+      return true;
+    }
+    snprintf(err, errn, "Spotify did not return a refresh token");
+    return false;
+  }
+
+  char msg[120];
+  extract_error_message(body, msg, sizeof(msg));
+  if (status == 400 && strstr(msg, "invalid_grant"))
+    snprintf(err, errn, "The code was already used or has expired - start the authorization again");
+  else if (status == 400 && strstr(msg, "invalid_client"))
+    snprintf(err, errn, "Spotify rejected the client ID/secret");
+  else if (status == 400 && strstr(msg, "redirect_uri"))
+    snprintf(err, errn, "Add exactly %s as a redirect URI in the Spotify dashboard", SPOTIFY_REDIRECT_URI);
+  else if (status < 0)
+    snprintf(err, errn, "Network error: %s", HTTPClient::errorToString(status).c_str());
+  else
+    snprintf(err, errn, "Spotify answered HTTP %d%s%s", status, *msg ? ": " : "", msg);
+  LOGW("auth", "code exchange failed: %s", err);
+  return false;
 }
 
 // ============================================================================
