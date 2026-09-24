@@ -196,28 +196,40 @@ static void handle_root() {
   b += F("</p></div>");
 
   // --- step 1: Wi-Fi ---
+  // Each step is its own form with its own button: one step is saved at a time,
+  // in order. (A <form> must stay inside one <div> - browsers drop the fields of
+  // a form that crosses a closing tag.)
   b += F("<div class=c><h2>1. Wi-Fi</h2><form method=POST action=/save>");
   b += portal_ssid_options();
   b += F("<label>Network name</label><input name=ssid list=nets autocapitalize=off autocorrect=off value='");
   html_escape(g_cfg.ssid, b);
   b += F("'><label>Password");
   if (g_cfg.has_wifi()) b += F(" (leave empty to keep the saved one)");
-  b += F("</label><input name=wpass type=password autocomplete=off>");
+  b += F("</label><input name=wpass type=password autocomplete=off>"
+         "<button type=submit>Save Wi-Fi</button></form></div>");
 
   // --- step 2: Spotify app ---
-  b += F("</div><div class=c><h2>2. Spotify app</h2><p>In the Spotify developer dashboard, create an app and add "
+  b += F("<div class=c><h2>2. Spotify app</h2><p>In the Spotify developer dashboard, create an app and add "
          "this exact redirect URI:</p><p><code>" SPOTIFY_REDIRECT_URI "</code></p>"
+         "<form method=POST action=/save>"
          "<label>Client ID</label><input name=cid autocapitalize=off autocorrect=off value='");
   html_escape(g_cfg.client_id, b);
   b += F("'><label>Client secret");
   if (g_cfg.has_client()) b += F(" (leave empty to keep the saved one)");
   b += F("</label><input name=csec type=password autocomplete=off>"
-         "<button type=submit>Save</button></div></form>");
+         "<button type=submit>Save Spotify app</button></form></div>");
 
   // --- step 3: authorize ---
   b += F("<div class=c><h2>3. Authorize</h2>");
   if (!sta_up) {
     b += F("<p>Save the Wi-Fi settings and restart first: this step needs the board to be online.</p>");
+  } else if (g_portal_mode == PORTAL_AP) {
+    // The phone is on the board's own network, which has no way out to the
+    // internet - and the captive-portal DNS answers every name with the board.
+    b += F("<p>Your phone is on the board's setup network, which has no internet access. "
+           "Restart the board so it joins your Wi-Fi, then reopen this page at the address shown on its "
+           "screen to finish this step.</p>"
+           "<form method=POST action=/restart><button type=submit>Restart now</button></form>");
   } else if (!g_cfg.has_client()) {
     b += F("<p>Save your client ID and secret first.</p>");
   } else {
@@ -269,13 +281,19 @@ static void handle_save() {
   char err[120] = "";
   g_portal_note[0] = 0;
 
+  // Each step has its own button, so a submission carries one step's fields;
+  // whatever is missing is simply left as it is.
+  bool client_saved = false;
   if (cid.length() && csec.length()) {
-    if (!config_save_client(cid.c_str(), csec.c_str())) strlcpy(err, "Client id/secret too long", sizeof(err));
-  } else if (cid.length() && g_cfg.has_client() && cid != g_cfg.client_id) {
-    strlcpy(err, "Enter the client secret as well when you change the client ID", sizeof(err));
+    if (config_save_client(cid.c_str(), csec.c_str())) client_saved = true;
+    else strlcpy(err, "Client id/secret too long", sizeof(err));
+  } else if (cid.length() && !csec.length() && (!g_cfg.has_client() || cid != g_cfg.client_id)) {
+    strlcpy(err, "Enter the client secret as well: it is stored together with the client ID", sizeof(err));
+  } else if (csec.length() && !cid.length()) {
+    strlcpy(err, "Enter the client ID as well", sizeof(err));
   }
 
-  bool wifi_changed = false;
+  bool wifi_changed = false, wifi_saved = false;
   if (!err[0] && ssid.length()) {
     const String pass = wpass.length() ? wpass : String(g_cfg.pass);
     const bool same = (ssid == g_cfg.ssid) && !wpass.length();
@@ -283,7 +301,12 @@ static void handle_save() {
     // Testing means joining the new network, which would cut off this very page
     // when it is served over the old one - so only test from the access point.
     const bool test_ok = same || g_portal_mode != PORTAL_AP || portal_test_wifi(ssid.c_str(), pass.c_str(), err, sizeof(err));
-    if (test_ok && !err[0]) config_save_wifi(ssid.c_str(), pass.c_str());
+    if (test_ok && !err[0]) {
+      config_save_wifi(ssid.c_str(), pass.c_str());
+      wifi_saved = true;
+    }
+  } else if (!err[0] && wpass.length()) {
+    strlcpy(err, "Enter the network name as well", sizeof(err));
   }
 
   String b;
@@ -292,25 +315,33 @@ static void handle_save() {
     html_escape(err, b);
     b += F("</p><a class='btn btn2' href=/>Back</a></div>");
     view_set_status("Check the setup page");
+  } else if (!wifi_saved && !client_saved) {
+    b += F("<div class=c><p>Nothing to save - the fields of that step were empty.</p>"
+           "<a class='btn btn2' href=/>Back</a></div>");
   } else {
-    snprintf(g_portal_note, sizeof(g_portal_note), "Settings saved.");
+    snprintf(g_portal_note, sizeof(g_portal_note), "%s saved.",
+             wifi_saved && client_saved ? "Wi-Fi and Spotify app" : (wifi_saved ? "Wi-Fi" : "Spotify app"));
     b += F("<div class=c><p class=ok>Saved.</p>");
-    if (g_portal_mode == PORTAL_AP) {
-      b += F("<p>Restart the board to join your network, then reopen this page at the address shown on its "
-             "screen to finish the Spotify authorization.</p>"
-             "<form method=POST action=/restart><button type=submit>Restart now</button></form>");
-      view_set_status("Saved - restart to continue");
+    if (wifi_changed && g_portal_mode == PORTAL_AP) {
+      // Still on the board's own network: the remaining steps can be filled in
+      // from here, but the authorization needs a phone with internet access.
+      b += F("<p>Next: fill in your Spotify app (step 2). Then restart the board so it joins your network and "
+             "reopen this page at the address shown on its screen to authorize it.</p>"
+             "<a class=btn href=/>Continue setup</a>"
+             "<form method=POST action=/restart><button class='btn btn2' type=submit>Restart now</button></form>");
+      view_set_status("Wi-Fi saved - continue on the page");
     } else if (wifi_changed) {
       b += F("<p>The new Wi-Fi settings apply after a restart. The board then shows its new address on the screen.</p>"
-             "<form method=POST action=/restart><button type=submit>Restart now</button></form>");
+             "<a class=btn href=/>Continue</a>"
+             "<form method=POST action=/restart><button class='btn btn2' type=submit>Restart now</button></form>");
       view_set_status("Saved - restart to apply");
     } else {
       b += F("<a class=btn href=/>Continue</a>");
-      view_set_status("Settings saved");
+      view_set_status(client_saved && !wifi_saved ? "Spotify app saved" : "Settings saved");
     }
     b += F("</div>");
   }
-  portal_send_page(b, err[0] ? "Not saved" : "Saved");
+  portal_send_page(b, err[0] ? "Not saved" : (wifi_saved || client_saved) ? "Saved" : "Nothing to save");
 }
 
 // Sends the phone to Spotify's consent page.
