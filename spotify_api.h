@@ -111,6 +111,11 @@ static void app_log(char level, const char *tag, const char *fmt, ...) {
 
 #define TLS_MIN_INTERNAL_BLOCK  (46 * 1024)  // a TLS session wants ~40-50 KB in one piece
 
+// Self-healing ladder when the API becomes unreachable while Wi-Fi is still up
+#define CONN_DIAG_AFTER_MS      20000    // dump the network state + a DNS test (once per outage)
+#define CONN_WIFI_RETRY_MS      90000    // then force a full Wi-Fi reconnect (fresh DHCP lease and DNS)
+#define CONN_REBOOT_AFTER_MS    600000   // last resort: restart the board. 0 disables it
+
 // ============================================================================
 // Heap / boot diagnostics
 // ============================================================================
@@ -255,6 +260,24 @@ static bool tls_heap_ok(const char *who) {
   return true;
 }
 
+// Logs everything needed to tell a DNS problem from a TCP/TLS one.
+static void net_diag_dump(const char *why) {
+  LOGW("net", "%s", why);
+  LOGW("net", "  wifi %s, IP %s, gateway %s, mask %s", WiFi.status() == WL_CONNECTED ? "connected" : "DOWN",
+       WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str(), WiFi.subnetMask().toString().c_str());
+  LOGW("net", "  DNS %s / %s, RSSI %d dBm, channel %d", WiFi.dnsIP(0).toString().c_str(),
+       WiFi.dnsIP(1).toString().c_str(), (int)WiFi.RSSI(), (int)WiFi.channel());
+  IPAddress ip;
+  const uint32_t t0 = millis();
+  const bool ok = WiFi.hostByName("api.spotify.com", ip) == 1;
+  if (ok)
+    LOGW("net", "  DNS test: api.spotify.com -> %s in %lu ms (name resolution works; the failure is TCP or TLS)",
+         ip.toString().c_str(), (unsigned long)(millis() - t0));
+  else
+    LOGW("net", "  DNS test: api.spotify.com FAILED after %lu ms (name resolution is the problem)",
+         (unsigned long)(millis() - t0));
+}
+
 // ============================================================================
 // Wi-Fi
 // ============================================================================
@@ -288,6 +311,7 @@ static bool     g_token_rejected = false;   // Spotify said the refresh token / 
 static char     g_token_error[160] = "";    // last token failure, human readable
 static String   g_refresh_token = REFRESH_TOKEN;
 
+static uint32_t g_api_session_at = 0;       // millis() when the current keep-alive session was opened
 static uint32_t g_backoff_until = 0;        // 429 / 5xx: no API traffic before this millis()
 static uint32_t g_backoff_ms = 0;           // current exponential step, 0 = not backing off
 
@@ -310,6 +334,11 @@ struct ApiResult {
 static void api_close() {
   if (g_api_tls.connected()) LOGD("api", "closing keep-alive session");
   g_api_tls.stop();
+  g_api_session_at = 0;
+}
+
+static inline bool is_connectivity_error(int status) {  // DNS / TCP / TLS / no Wi-Fi, not an HTTP or auth error
+  return status == API_ERR_NO_WIFI || (status < 0 && status != API_ERR_AUTH && status != API_ERR_BACKOFF);
 }
 
 static bool api_in_backoff(uint32_t *remaining_ms = nullptr) {
@@ -513,6 +542,10 @@ static bool spotify_request(const char *method, const char *path_and_query, ApiR
 
     const bool reused = g_api_tls.connected();
     if (!reused) {
+      if (g_api_session_at)
+        LOGI("api", "previous keep-alive session lasted %lu s before it closed",
+             (unsigned long)((millis() - g_api_session_at) / 1000));
+      g_api_session_at = 0;
       tls_prepare(g_api_tls);  // re-arm the CA bundle: a previous stop() wiped it (see tls_prepare)
       tls_heap_ok("api handshake");
     }
@@ -573,9 +606,11 @@ static bool spotify_request(const char *method, const char *path_and_query, ApiR
     res.status = code;
     LOGD("api", "%s %s -> %d, %u B, %lu ms (%s)", method, path_and_query, code, res.body.length(),
          (unsigned long)res.elapsed_ms, reused ? "keep-alive" : "new TLS session");
-    if (!reused)  // should appear once, then every request reuses the session (100-200 ms)
+    if (!reused) {  // should appear rarely; in between, every request reuses the session (100-200 ms)
+      g_api_session_at = millis();
       LOGI("api", "new TLS session to api.spotify.com: %s %s took %lu ms incl. handshake", method, path_and_query,
            (unsigned long)res.elapsed_ms);
+    }
 
     // 401: token expired/revoked early. Keyed on the status code only.
     if (code == 401 && !auth_retry_done) {

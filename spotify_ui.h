@@ -713,6 +713,62 @@ static void player_set_idle(const char *title, const char *detail) {
   if (was) LOGI("poll", "playback stopped -> idle (%s)", title);
 }
 
+// --- connectivity ladder ---------------------------------------------------
+// Anything that stops the device from reaching api.spotify.com while Wi-Fi is
+// up: first explain it in the log, then re-do DHCP/DNS, then restart.
+static uint32_t g_conn_bad_since = 0;  // 0 = healthy
+static bool g_conn_diag_done = false, g_conn_wifi_kicked = false;
+
+static void conn_mark_bad() {
+  if (!g_conn_bad_since) g_conn_bad_since = millis();
+}
+
+static void conn_mark_good() {
+  if (g_conn_bad_since)
+    LOGI("net", "connectivity restored after %lu s", (unsigned long)((millis() - g_conn_bad_since) / 1000));
+  g_conn_bad_since = 0;
+  g_conn_diag_done = false;
+  g_conn_wifi_kicked = false;
+}
+
+static void conn_ladder() {
+  if (!g_conn_bad_since) return;
+  const uint32_t bad_ms = millis() - g_conn_bad_since;
+
+  if (!g_conn_diag_done && bad_ms >= CONN_DIAG_AFTER_MS) {
+    g_conn_diag_done = true;
+    net_diag_dump("api.spotify.com unreachable for 20 s - network state:");
+    if (WiFi.status() == WL_CONNECTED && WiFi.dnsIP(0) == IPAddress((uint32_t)0)) {
+      const IPAddress gw = WiFi.gatewayIP();
+      LOGW("net", "no DNS server configured (lost on a DHCP renewal?) - falling back to the gateway %s",
+           gw.toString().c_str());
+      WiFi.setDNS(gw);
+    }
+  }
+
+  if (!g_conn_wifi_kicked && bad_ms >= CONN_WIFI_RETRY_MS && WiFi.status() == WL_CONNECTED) {
+    g_conn_wifi_kicked = true;
+    LOGW("net", "still unreachable after %lu s - reconnecting Wi-Fi for a fresh DHCP lease and DNS",
+         (unsigned long)(bad_ms / 1000));
+    notify_user("Reconnecting Wi-Fi");
+    api_close();
+    WiFi.disconnect();
+    delay(300);
+    WiFi.begin(SSID, PASSWORD);
+  }
+
+#if CONN_REBOOT_AFTER_MS > 0
+  // Only when the Wi-Fi link itself is fine: if the link is down there is
+  // nothing a restart can fix, and the Wi-Fi branch keeps retrying anyway.
+  if (bad_ms >= CONN_REBOOT_AFTER_MS && WiFi.status() == WL_CONNECTED) {
+    LOGE("net", "no connection to Spotify for %lu s - restarting the board", (unsigned long)(bad_ms / 1000));
+    player_set_idle("Restarting", "No connection for 10 minutes");
+    delay(1500);  // let the screen redraw and the serial buffer drain
+    ESP.restart();
+  }
+#endif
+}
+
 static void on_poll_error(const ApiResult &r) {
   if (r.status == API_ERR_BACKOFF || r.status == API_ERR_NO_WIFI) return;  // already reported
   ++g_poll_failures;
@@ -759,6 +815,7 @@ static void poll_player() {
   const bool ok = spotify_request("GET", path, r);
 
   if (!ok) {
+    if (is_connectivity_error(r.status)) conn_mark_bad();
     on_poll_error(r);
     uint32_t wait = 0;
     if (api_in_backoff(&wait)) g_next_poll = millis() + max<uint32_t>(wait, POLL_INTERVAL_MS);
@@ -766,6 +823,7 @@ static void poll_player() {
     return;
   }
   g_next_poll = t_start + POLL_INTERVAL_MS;
+  conn_mark_good();
   if (g_poll_failures || g_last_poll_error[0]) LOGI("poll", "recovered after %lu failure(s)", (unsigned long)g_poll_failures);
   g_poll_failures = 0;
   g_last_poll_error[0] = 0;
@@ -917,6 +975,7 @@ static void net_task(void *) {
     const uint32_t now = millis();
 
     if (WiFi.status() != WL_CONNECTED) {
+      conn_mark_bad();
       if (online) {
         online = false;
         offline_since = now;
@@ -936,6 +995,7 @@ static void net_task(void *) {
         revert_optimistic(c.type);
         notify_user("Offline\nWaiting for Wi-Fi");
       }
+      conn_ladder();
       delay(100);
       continue;
     }
@@ -957,6 +1017,7 @@ static void net_task(void *) {
       g_prefetch_pending = false;
       art_run_pipeline(with_prefetch);
     }
+    conn_ladder();
     if ((int32_t)(now - next_stats) >= 0) {
       next_stats = now + STATS_EVERY_MS;
       log_stats();
