@@ -1,7 +1,7 @@
 # esp32-spotify-remote
 
-A Spotify "now playing" remote for a 1.8" round 360×360 touchscreen (ESP32-S3,
-JC3636W518EN class). It shows the current track with its cover art and a
+A Spotify remote for a 1.8" round 360×360 touchscreen (ESP32-S3,
+JC3636W518EN class bought from Aliexpress) powered by USB-C, built with Claude AI. It shows the current track with its cover art and a
 progress ring, and lets you play, pause and skip by touching the screen.
 
 It talks to the Spotify Web API directly over HTTPS — no third-party Spotify
@@ -100,7 +100,7 @@ For anyone who would rather not install an IDE. The image is credential-free and
 identical for everybody; everything personal is entered afterwards on the device.
 
 Download `esp32-spotify-remote-<version>.bin` from the
-[releases page](https://github.com/<OWNER>/esp32-spotify-remote/releases) and
+[releases page](https://github.com/xsvgnt/esp32-spotify-remote/releases) and
 check it against `SHA256SUMS.txt`.
 
 ### With a browser (nothing to install)
@@ -205,8 +205,8 @@ bold will stop the board working if they are wrong.
 | Board | **ESP32S3 Dev Module** |
 | **PSRAM** | **OPI PSRAM** |
 | **Flash Size** | **16MB (128Mb)** |
-| **Partition Scheme** | **16M Flash (3MB APP/9.9MB FATFS)** |
-| **Flash Mode** | **QIO 80MHz** |
+| **Partition Scheme** | **Huge APP (3M No OTA/1MB SPIFFS)** |
+| **Flash Mode** | **QIO 120MHz** |
 | USB CDC On Boot | Enabled *(so the serial log appears)* |
 | Arduino Runs On | Core 1 |
 | Events Run On | Core 1 |
@@ -215,6 +215,12 @@ bold will stop the board working if they are wrong.
 
 Then **Upload**. The build is about 1.6 MB, half of the 3 MB application
 partition.
+
+> The pre-built image in the releases is built with **16M Flash (3MB APP/9.9MB
+> FATFS)** and **QIO 80MHz**, since 120 MHz is marked experimental by Espressif
+> and not every flash chip is happy with it. Either partition scheme gives the
+> same 3 MB application space, and the image carries its own partition table, so
+> flashing it does not depend on what is selected here.
 
 ### Serial log
 
@@ -415,6 +421,14 @@ the details again.
 **The clock never sets, so night mode never starts.** The board needs to reach
 `pool.ntp.org`. Some routers intercept or block NTP; the setup page's status card
 shows whether the clock is set.
+
+---
+
+## Known Issues
+
+Only ASCII characters are supported. Accented characters are changed to their ASCII equivalent.
+Chinese, Japanese or other scripts are rendered as boxes.
+
 
 ---
 
