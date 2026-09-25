@@ -36,7 +36,6 @@
 #include <esp_chip_info.h>
 #include <stdarg.h>
 #include <time.h>
-#include "secrets.h"
 
 // ============================================================================
 // Logging
@@ -183,7 +182,7 @@ static void print_boot_diagnostics() {
   const esp_partition_t *running = esp_ota_get_running_partition();
   const uint32_t sketch = ESP.getSketchSize();
   const uint32_t part = running ? running->size : 0;
-  LOGI("boot", "================ SpotifyESP32Gui v2 ================");
+  LOGI("boot", "============== esp32-spotify-remote ==============");
   LOGI("boot", "chip        %s rev %u, %u cores @ %lu MHz", ESP.getChipModel(), (unsigned)ESP.getChipRevision(),
        (unsigned)ESP.getChipCores(), (unsigned long)ESP.getCpuFreqMHz());
   LOGI("boot", "flash       %lu MB, %s @ %lu MHz", (unsigned long)(ESP.getFlashChipSize() / (1024 * 1024)),
@@ -701,7 +700,7 @@ static bool spotify_request(const char *method, const char *path_and_query, ApiR
     g_api_http.setReuse(true);
     g_api_http.setTimeout(HTTP_TIMEOUT_MS);
     g_api_http.setConnectTimeout(HTTP_TIMEOUT_MS);
-    g_api_http.setUserAgent("SpotifyESP32Gui/2");
+    g_api_http.setUserAgent("esp32-spotify-remote/1.0");
     const char *hdrs[] = {"Retry-After"};
     g_api_http.collectHeaders(hdrs, 1);  // re-arming also clears the previous response's value
     g_api_http.addHeader("Authorization", String("Bearer ") + g_access_token);

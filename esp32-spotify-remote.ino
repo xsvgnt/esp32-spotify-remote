@@ -1,5 +1,5 @@
 /*
- * SpotifyESP32Gui_v2 - Spotify "now playing" remote for a 1.8" round 360x360
+ * esp32-spotify-remote - Spotify "now playing" remote for a 1.8" round 360x360
  * ST77916 touchscreen (ESP32-S3, JC3636W518EN class). Talks to the Spotify
  * Web API directly over HTTPS; no Spotify library.
  *
@@ -17,8 +17,9 @@
  * reach that page again later; the same window carries the brightness slider.
  * The page also has a night mode: between two hours of the local day the panel
  * is off and nothing is polled (the board gets the time over SNTP).
- * extras/get_refresh_token.py is still there if you prefer doing the
- * authorization on a PC and filling in secrets.h.
+ *
+ * Nothing is compiled in and nothing is secret: the same binary works for
+ * anybody, which is why a pre-built image can be published. See README.md.
  */
 
 // Serial logging: 0 = off, 1 = errors, 2 = + warnings, 3 = + info, 4 = + debug

@@ -16,25 +16,17 @@
  * stored without its password, say). A record that fails its CRC is ignored,
  * and the board starts its setup portal.
  *
+ * Nothing is compiled into the firmware: a freshly flashed board has an empty
+ * record and starts its setup portal, so the same binary works for anybody.
+ *
  * NVS is NOT encrypted: anyone with a USB cable and esptool can read this out
  * of flash unless you enable flash encryption (an irreversible efuse change).
  * The Wi-Fi password is in NVS anyway - the Wi-Fi stack stores its own copy.
- *
- * secrets.h is only a seed: on a device with empty NVS its values (when they
- * are not the "XXX" placeholders) are copied in once, so an already-working
- * device keeps working after the update. "Forget everything" in the setup page
- * clears NVS and disables the seed, giving a true out-of-the-box first boot.
- * Set CONFIG_SEED_FROM_SECRETS to 0 to ignore secrets.h completely.
  */
 
 #include <Arduino.h>
 #include <Preferences.h>
 #include <mbedtls/base64.h>
-#include "secrets.h"
-
-#ifndef CONFIG_SEED_FROM_SECRETS
-#define CONFIG_SEED_FROM_SECRETS 1
-#endif
 
 #define CFG_NAMESPACE  "spotcfg"
 #define CFG_BLOB_KEY   "cfg"
@@ -169,10 +161,6 @@ static bool config_make_auth_b64(const char *id, const char *secret, char *out, 
   return true;
 }
 
-static bool config_is_placeholder(const char *v) {
-  return v == nullptr || v[0] == 0 || strcmp(v, "XXX") == 0;
-}
-
 // The settings a board with nothing stored starts from.
 static void config_defaults() {
   g_cfg.brightness = CFG_BRIGHT_DEFAULT;
@@ -294,31 +282,6 @@ static void config_load() {
   g_prefs.begin(CFG_NAMESPACE, false);
 
   if (!config_read_blob()) config_migrate_legacy();
-
-#if CONFIG_SEED_FROM_SECRETS
-  if (!g_prefs.getBool("seeded", false)) {
-    g_prefs.putBool("seeded", true);
-    bool seeded = false;
-    if (!g_cfg.has_wifi() && !config_is_placeholder(SSID)) {
-      strlcpy(g_cfg.ssid, SSID, sizeof(g_cfg.ssid));
-      strlcpy(g_cfg.pass, PASSWORD, sizeof(g_cfg.pass));
-      seeded = true;
-    }
-    if (!g_cfg.has_client() && !config_is_placeholder(AUTH_B64)) {
-      strlcpy(g_cfg.auth_b64, AUTH_B64, sizeof(g_cfg.auth_b64));
-      strlcpy(g_cfg.client_id, "(from secrets.h)", sizeof(g_cfg.client_id));
-      seeded = true;
-    }
-    if (!g_cfg.has_token() && !config_is_placeholder(REFRESH_TOKEN)) {
-      strlcpy(g_cfg.refresh_token, REFRESH_TOKEN, sizeof(g_cfg.refresh_token));
-      seeded = true;
-    }
-    if (seeded) {
-      LOGI("cfg", "seeded the stored configuration from secrets.h (first boot only)");
-      config_store();
-    }
-  }
-#endif
 }
 
 static void config_save_wifi(const char *ssid, const char *pass) {
@@ -372,11 +335,9 @@ static void config_clear_token() {
   LOGW("cfg", "cleared the stored refresh token - re-authorization needed");
 }
 
-// Wipes everything and keeps the secrets.h seed disabled, so the next boot
-// behaves like a freshly flashed device.
+// Wipes everything, so the next boot behaves like a freshly flashed device.
 static void config_forget() {
   g_prefs.clear();
-  g_prefs.putBool("seeded", true);
   memset(&g_cfg, 0, sizeof(g_cfg));
   config_defaults();  // brightness and night mode go too - back to out-of-the-box values
   LOGW("cfg", "all stored settings erased");
@@ -390,12 +351,5 @@ static void config_log() {
        g_cfg.has_wifi() ? "set" : "MISSING", g_cfg.has_client() ? "set" : "MISSING",
        g_cfg.has_token() ? "set" : "MISSING", (unsigned)g_cfg.brightness, night);
 }
-
-// secrets.h is done with: drop its macros so they cannot collide with real
-// identifiers later (WiFi.SSID() is a method, "SSID" as a macro breaks it).
-#undef SSID
-#undef PASSWORD
-#undef AUTH_B64
-#undef REFRESH_TOKEN
 
 #endif  // _APP_CONFIG_H_

@@ -1,0 +1,1 @@
+4ce9b1020784c2af723dc7626eaeb738e9a987b2fd0f25aeb780bb04257aa3fe  esp32-spotify-remote-1.0.0.bin
