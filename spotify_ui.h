@@ -86,7 +86,7 @@
 #define TAP_FEEDBACK_MS       700
 #define TOAST_MS              4500
 #define IDLE_DIM_AFTER_MS     10000
-#define BACKLIGHT_FULL        100
+#define BACKLIGHT_FULL        100     // ceiling; the level actually used is g_cfg.brightness
 #define BACKLIGHT_DIM         10
 
 #define SETUP_LONG_PRESS_MS   5000    // hold the screen this long to open the setup portal
@@ -110,6 +110,9 @@
 #define STATS_EVERY_MS        60000
 #define NET_TASK_STACK        16384
 #define NET_TASK_CORE         0
+
+#define NIGHT_WAKE_MS         30000   // a touch during the night: awake this long, longer while a track plays
+#define NIGHT_SLEEP_TICK_MS   200     // net_task does nothing but this while asleep
 
 // ============================================================================
 // Shared state (core 0 <-> core 1)
@@ -137,11 +140,13 @@ struct PlayerState {
   uint32_t toast_seq;
   // provisioning
   bool     setup_mode;      // the setup portal is running: show the setup screen
+  bool     asleep;          // night mode: panel off, nothing polled
 };
 
 enum AppMode : uint8_t { MODE_PLAYER = 0, MODE_SETUP };
 static volatile AppMode g_mode = MODE_PLAYER;
 static volatile bool g_setup_requested = false;  // set by the long-press on the screen
+static volatile bool g_wake_requested = false;   // set by a touch while the night mode has the panel off
 
 enum CmdType : uint8_t { CMD_PLAY = 0, CMD_PAUSE, CMD_NEXT, CMD_PREV };
 struct Cmd {
@@ -987,6 +992,12 @@ static void set_setup_flag(bool on) {
   ps_unlock();
 }
 
+static void set_asleep_flag(bool on) {
+  ps_lock();
+  g_ps.asleep = on;
+  ps_unlock();
+}
+
 // Opens the provisioning portal: on the LAN when Wi-Fi works (the phone stays
 // on the home network), otherwise as an access point of our own.
 static void enter_setup(bool force_ap, const char *why) {
@@ -1009,6 +1020,23 @@ static void leave_setup() {
   LOGI("net", "setup finished - back to the player");
 }
 
+// Should the board be asleep right now? Inside the window the panel is off and
+// nothing is polled at all. A touch buys NIGHT_WAKE_MS of daylight, and while a
+// track is playing that deadline keeps moving, so the board goes back to sleep
+// 30 s after playback stops. Entering the window always sleeps, playing or not.
+// `wake_until` is the caller's state (a millis() deadline, 0 = no wake).
+static bool night_should_sleep(uint32_t now, bool in_window, bool touched, bool playing, uint32_t &wake_until) {
+  if (!in_window) {
+    wake_until = 0;
+    return false;
+  }
+  if (touched) wake_until = now + NIGHT_WAKE_MS;
+  else if (wake_until && playing) wake_until = now + NIGHT_WAKE_MS;
+  if (wake_until && (int32_t)(now - wake_until) < 0) return false;
+  wake_until = 0;
+  return true;
+}
+
 static void net_task(void *) {
   LOGI("net", "net_task started on core %d", (int)xPortGetCoreID());
   tls_prepare(g_api_tls);
@@ -1016,9 +1044,10 @@ static void net_task(void *) {
   build_filters();
   config_log();
 
-  bool online = false, ever_online = false;
+  bool online = false, ever_online = false, asleep = false;
   const uint32_t boot_ms = millis();
   uint32_t offline_since = millis(), next_wifi_kick = millis() + 20000, next_stats = millis() + STATS_EVERY_MS;
+  uint32_t wake_until = 0;  // night mode: awake until this millis() after a touch
 
   if (!g_cfg.has_wifi()) {
     enter_setup(true, "no Wi-Fi credentials stored");
@@ -1093,10 +1122,42 @@ static void net_task(void *) {
       log_heap("wifi up");
       set_idle_text("Signing in", "Contacting Spotify");
       g_next_poll = now;
+      clock_begin();  // SNTP: the night window needs the local time (and re-syncs after an outage)
       if (!g_cfg.has_client() || !g_cfg.has_token()) {
         enter_setup(false, !g_cfg.has_client() ? "no Spotify app credentials stored" : "not authorized yet");
         continue;
       }
+    }
+
+    // ---- night mode ----
+    bool touched = false;
+    if (g_wake_requested) {
+      g_wake_requested = false;
+      touched = true;
+    }
+    bool playing_now = false;
+    ps_lock();
+    playing_now = g_ps.playing;
+    ps_unlock();
+    const bool sleep_now = night_should_sleep(now, night_now(), touched, playing_now, wake_until);
+    if (sleep_now != asleep) {
+      asleep = sleep_now;
+      set_asleep_flag(asleep);
+      if (asleep) {
+        wake_until = 0;
+        api_close();  // an hours-long idle TLS session would be dead anyway
+        LOGI("night", "night window %02u:00-%02u:00 - screen off, polling stopped", (unsigned)g_cfg.night_start,
+             (unsigned)g_cfg.night_end);
+      } else {
+        g_next_poll = now;
+        LOGI("night", "awake");
+      }
+    }
+    if (asleep) {
+      Cmd c;
+      while (xQueueReceive(g_cmd_q, &c, 0) == pdTRUE) {}  // nothing can be tapped with the panel off
+      delay(NIGHT_SLEEP_TICK_MS);
+      continue;
     }
 
     service_commands();
@@ -1211,7 +1272,12 @@ static uint32_t ui_idle_since = 0;
 static int8_t   ui_idle_state = -1;   // -1 unknown, 0 track view, 1 idle view
 static int8_t   ui_art_state = -1;    // -1 unknown, 0 logo, 1 cover
 static uint8_t  ui_backlight = 0;
+static uint8_t  ui_bright_preview = 0;  // slider being dragged: overrides the stored level
+static bool     ui_asleep = false;      // night mode: the panel is off
 static char     ui_title_txt[128], ui_artist_txt[160], ui_time_txt[32];
+
+// The level the panel should be at right now, ignoring the idle dimming.
+static uint8_t ui_brightness() { return ui_bright_preview ? ui_bright_preview : g_cfg.brightness; }
 
 static void set_text_if_changed(lv_obj_t *label, char *cache, size_t n, const char *text) {
   if (strcmp(cache, text) == 0) return;  // re-setting would restart the scroll animation
@@ -1261,11 +1327,19 @@ static void on_art_clicked(lv_event_t *) {
 }
 
 static void on_prev_clicked(lv_event_t *) {
+  if (ui_ignore_click) {  // the press that woke the panel, or opened the setup dialog
+    ui_ignore_click = false;
+    return;
+  }
   LOGI("ui", "tap previous");
   send_cmd(CMD_PREV);
 }
 
 static void on_next_clicked(lv_event_t *) {
+  if (ui_ignore_click) {
+    ui_ignore_click = false;
+    return;
+  }
   LOGI("ui", "tap next");
   send_cmd(CMD_NEXT);
 }
@@ -1273,12 +1347,40 @@ static void on_next_clicked(lv_event_t *) {
 static void setup_box_event(lv_event_t *e) {
   lv_obj_t *box = lv_event_get_current_target(e);
   const uint16_t id = lv_msgbox_get_active_btn(box);
+  if (id == LV_BTNMATRIX_BTN_NONE) return;  // not the buttons (the slider does not bubble, but be sure)
   if (id == 1) {
     LOGI("ui", "setup requested from the screen");
     g_setup_requested = true;
   }
+  ui_bright_preview = 0;
   lv_msgbox_close(box);
   ui_setup_box = nullptr;
+}
+
+// The slider runs 1..10 so every step is exactly 10 %. Moving it lights the
+// panel straight away; the value reaches flash when the finger is lifted.
+static void brightness_event(lv_event_t *e) {
+  lv_obj_t *s = lv_event_get_target(e);
+  const uint8_t percent = (uint8_t)(lv_slider_get_value(s) * CFG_BRIGHT_STEP);
+  switch (lv_event_get_code(e)) {
+    case LV_EVENT_VALUE_CHANGED: {
+      ui_bright_preview = percent;
+      if (ui_backlight != percent) {
+        ui_backlight = percent;
+        set_brightness(percent);
+      }
+      lv_obj_t *label = (lv_obj_t *)lv_event_get_user_data(e);
+      if (label) lv_label_set_text_fmt(label, "Brightness %u%%", (unsigned)percent);
+      break;
+    }
+    case LV_EVENT_RELEASED:
+    case LV_EVENT_PRESS_LOST:
+      ui_bright_preview = 0;
+      config_save_brightness(percent);  // one flash write per adjustment
+      break;
+    default:
+      break;
+  }
 }
 
 static void show_setup_confirm() {
@@ -1287,15 +1389,47 @@ static void show_setup_confirm() {
   ui_setup_box = lv_msgbox_create(NULL, "Setup", "Open the setup page\n(Wi-Fi, Spotify account)?", btns, false);
   lv_obj_set_style_text_font(ui_setup_box, &lv_font_montserrat_16, 0);
   lv_obj_set_width(ui_setup_box, 236);       // stay inside the round screen
+
+  // Brightness, under the question: stack the content so the message, the
+  // label and the slider follow each other and the box grows to fit.
+  lv_obj_t *content = lv_msgbox_get_content(ui_setup_box);
+  lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(content, 8, 0);
+
+  lv_obj_t *lbl = lv_label_create(content);
+  lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+  lv_label_set_text_fmt(lbl, "Brightness %u%%", (unsigned)g_cfg.brightness);
+
+  lv_obj_t *slider = lv_slider_create(content);
+  lv_obj_set_width(slider, 180);
+  lv_slider_set_range(slider, CFG_BRIGHT_MIN / CFG_BRIGHT_STEP, CFG_BRIGHT_MAX / CFG_BRIGHT_STEP);
+  lv_slider_set_value(slider, g_cfg.brightness / CFG_BRIGHT_STEP, LV_ANIM_OFF);
+  lv_obj_set_style_bg_color(slider, lv_color_hex(COLOR_SPOTIFY_GREEN), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(slider, lv_color_white(), LV_PART_KNOB);  // stays visible at either end
+  lv_obj_add_event_cb(slider, brightness_event, LV_EVENT_VALUE_CHANGED, lbl);
+  lv_obj_add_event_cb(slider, brightness_event, LV_EVENT_RELEASED, lbl);
+  lv_obj_add_event_cb(slider, brightness_event, LV_EVENT_PRESS_LOST, lbl);
+
   lv_obj_update_layout(ui_setup_box);        // size first, then centre
   lv_obj_center(ui_setup_box);
   lv_obj_add_event_cb(ui_setup_box, setup_box_event, LV_EVENT_VALUE_CHANGED, NULL);
 }
 
 // Hold anywhere on the player screen to reach the setup portal again.
+// Everything on this screen bubbles its presses up here, so the first touch
+// during the night reaches this handler whatever it lands on.
 static void on_screen_event(lv_event_t *e) {
   switch (lv_event_get_code(e)) {
     case LV_EVENT_PRESSED:
+      if (ui_asleep) {  // panel off: this touch only wakes it, it presses nothing
+        g_wake_requested = true;
+        ui_ignore_click = true;
+        ui_press_start = 0;
+        LOGI("ui", "touch while asleep - waking the screen");
+        break;
+      }
+      ui_ignore_click = false;  // a press that starts with the panel lit is a real one
       ui_press_start = millis();
       ui_press_fired = ui_press_hinted = false;
       break;
@@ -1490,8 +1624,11 @@ static void ui_build() {
   lv_label_set_text(ui_toast, "");
   lv_obj_add_flag(ui_toast, LV_OBJ_FLAG_HIDDEN);
 
-  // Long press anywhere (the artwork bubbles its presses up) opens setup.
+  // Long press anywhere opens setup, and any touch wakes the panel at night:
+  // both need every child's presses to bubble up to the screen.
   lv_obj_add_flag(ui_art, LV_OBJ_FLAG_EVENT_BUBBLE);
+  lv_obj_add_flag(ui_prev, LV_OBJ_FLAG_EVENT_BUBBLE);
+  lv_obj_add_flag(ui_next, LV_OBJ_FLAG_EVENT_BUBBLE);
   lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(scr, on_screen_event, LV_EVENT_ALL, NULL);
 
@@ -1513,15 +1650,35 @@ static void ui_tick(lv_timer_t *) {
     if (ui_setup_box) {
       lv_msgbox_close(ui_setup_box);
       ui_setup_box = nullptr;
+      ui_bright_preview = 0;  // the slider went with it
     }
     lv_scr_load(ui_setup_shown ? ui_setup_scr : ui_player_scr);
     LOGI("ui", "%s screen", ui_setup_shown ? "setup" : "player");
   }
   if (ui_setup_shown) {
     ui_apply_setup_view();
-    if (ui_backlight != BACKLIGHT_FULL) {  // keep it readable while someone is setting it up
-      ui_backlight = BACKLIGHT_FULL;
-      set_brightness(BACKLIGHT_FULL);
+    ui_asleep = false;  // the setup portal is never blacked out
+    if (ui_backlight != ui_brightness()) {  // no dimming while someone is setting it up
+      ui_backlight = ui_brightness();
+      set_brightness(ui_backlight);
+    }
+    return;
+  }
+
+  // 0b. Night mode: panel off, widgets left as they are until the next wake
+  if (s.asleep != ui_asleep) {
+    ui_asleep = s.asleep;
+    LOGI("ui", "%s", ui_asleep ? "night mode - panel off" : "night mode - panel back on");
+    if (ui_asleep && ui_setup_box) {  // a dialog left open would be unreachable
+      lv_msgbox_close(ui_setup_box);
+      ui_setup_box = nullptr;
+      ui_bright_preview = 0;
+    }
+  }
+  if (ui_asleep) {
+    if (ui_backlight != 0) {
+      ui_backlight = 0;
+      set_brightness(0);
     }
     return;
   }
@@ -1609,9 +1766,10 @@ static void ui_tick(lv_timer_t *) {
     ui_toast_until = 0;
   }
 
-  // 7. Backlight: 10 % after 10 s idle without touch; full on a track or a touch
-  uint8_t want_bl = BACKLIGHT_FULL;
-  if (idle && (now - ui_idle_since) >= IDLE_DIM_AFTER_MS && lv_disp_get_inactive_time(NULL) >= IDLE_DIM_AFTER_MS)
+  // 7. Backlight: the chosen level on a track or a touch, 10 % after 10 s idle
+  uint8_t want_bl = ui_brightness();
+  if (!ui_bright_preview && idle && (now - ui_idle_since) >= IDLE_DIM_AFTER_MS &&
+      lv_disp_get_inactive_time(NULL) >= IDLE_DIM_AFTER_MS && want_bl > BACKLIGHT_DIM)
     want_bl = BACKLIGHT_DIM;
   if (want_bl != ui_backlight) {
     ui_backlight = want_bl;
@@ -1657,11 +1815,11 @@ static void ui_init() {
   display_init();
   ui_build();
   lv_timer_create(ui_tick, UI_TICK_MS, NULL);
-  ui_backlight = BACKLIGHT_FULL;  // what ui_tick() will want; the panel is still dark
-  ui_tick(nullptr);               // sync the widgets with the initial state
+  ui_backlight = g_cfg.brightness;  // what ui_tick() will want; the panel is still dark
+  ui_tick(nullptr);                 // sync the widgets with the initial state
 
-  lv_refr_now(NULL);              // draw the first frame, then light the panel (no garbage flash)
-  set_brightness(BACKLIGHT_FULL);
+  lv_refr_now(NULL);                // draw the first frame, then light the panel (no garbage flash)
+  set_brightness(g_cfg.brightness);
   log_heap("ui ready");
 }
 

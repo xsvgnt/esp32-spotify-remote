@@ -117,6 +117,7 @@ static const char PORTAL_CSS[] PROGMEM =
   "h1{font-size:20px;margin:4px 0 16px}h2{font-size:16px;margin:0 0 10px;color:#1DB954}"
   ".c{background:#1c1c1c;border:1px solid #2c2c2c;border-radius:12px;padding:14px;margin:0 0 14px}"
   "label{display:block;margin:10px 0 4px;font-size:14px;color:#b3b3b3}"
+  "input[type=checkbox]{accent-color:#1DB954}"
   "input,select{width:100%;padding:12px;border-radius:8px;border:1px solid #3a3a3a;background:#101010;color:#fff;font-size:16px}"
   "button,.btn{display:inline-block;width:100%;margin-top:14px;padding:13px;border:0;border-radius:24px;background:#1DB954;"
   "color:#000;font-size:16px;font-weight:600;text-align:center;text-decoration:none;cursor:pointer}"
@@ -124,8 +125,69 @@ static const char PORTAL_CSS[] PROGMEM =
   "code{background:#000;padding:3px 6px;border-radius:6px;font-size:13px;word-break:break-all}"
   ".nb{white-space:nowrap}"
   "p{margin:8px 0;font-size:14px;color:#b3b3b3}.ok{color:#1DB954}.bad{color:#ff6b6b}"
+  ".row{display:flex;gap:10px}.row>div{flex:1}"
   "ol{margin:8px 0 0 18px;padding:0;font-size:14px;color:#b3b3b3}li{margin:6px 0}"
   "</style>";
+
+// ---------------------------------------------------------------------------
+// Time zones offered on the page
+// ---------------------------------------------------------------------------
+// POSIX TZ rules, so the board handles daylight saving on its own. std_min is
+// the standard-time offset in minutes and dst says whether the zone changes:
+// together they identify a zone well enough for the page to preselect the one
+// matching the browser (see the script in handle_root).
+struct TzOption {
+  const char *rule;
+  const char *label;
+  int16_t std_min;
+  uint8_t dst;
+};
+
+static const TzOption PORTAL_TZ[] = {
+    {"UTC0", "UTC", 0, 0},
+    {"GMT0BST,M3.5.0/1,M10.5.0", "UK, Ireland, Portugal", 0, 1},
+    {"CET-1CEST,M3.5.0,M10.5.0/3", "Central Europe (Paris, Berlin, Madrid)", 60, 1},
+    {"EET-2EEST,M3.5.0/3,M10.5.0/4", "Eastern Europe (Athens, Helsinki)", 120, 1},
+    {"WAT-1", "West Africa (Lagos, Algiers)", 60, 0},
+    {"SAST-2", "South Africa", 120, 0},
+    {"MSK-3", "Moscow, Istanbul", 180, 0},
+    {"EAT-3", "East Africa (Nairobi)", 180, 0},
+    {"<+04>-4", "Gulf (Dubai, Baku)", 240, 0},
+    {"IST-5:30", "India, Sri Lanka", 330, 0},
+    {"<+07>-7", "Bangkok, Jakarta", 420, 0},
+    {"CST-8", "China, Singapore, Hong Kong", 480, 0},
+    {"AWST-8", "Perth", 480, 0},
+    {"JST-9", "Japan", 540, 0},
+    {"KST-9", "Korea", 540, 0},
+    {"ACST-9:30ACDT,M10.1.0,M4.1.0/3", "Adelaide", 570, 1},
+    {"AEST-10", "Brisbane", 600, 0},
+    {"AEST-10AEDT,M10.1.0,M4.1.0/3", "Sydney, Melbourne", 600, 1},
+    {"NZST-12NZDT,M9.5.0,M4.1.0/3", "New Zealand", 720, 1},
+    {"<-01>1", "Azores, Cape Verde", -60, 0},
+    {"<-03>3", "Sao Paulo, Buenos Aires", -180, 0},
+    {"AST4ADT,M3.2.0,M11.1.0", "Atlantic Canada", -240, 1},
+    {"<-05>5", "Bogota, Lima", -300, 0},
+    {"EST5EDT,M3.2.0,M11.1.0", "US Eastern (New York, Toronto)", -300, 1},
+    {"CST6", "Mexico City", -360, 0},
+    {"CST6CDT,M3.2.0,M11.1.0", "US Central (Chicago)", -360, 1},
+    {"MST7", "Arizona", -420, 0},
+    {"MST7MDT,M3.2.0,M11.1.0", "US Mountain (Denver)", -420, 1},
+    {"PST8PDT,M3.2.0,M11.1.0", "US Pacific (Los Angeles)", -480, 1},
+    {"AKST9AKDT,M3.2.0,M11.1.0", "Alaska", -540, 1},
+    {"HST10", "Hawaii", -600, 0},
+};
+
+static bool tz_is_known(const char *rule) {
+  for (const TzOption &o : PORTAL_TZ)
+    if (strcmp(o.rule, rule) == 0) return true;
+  return false;
+}
+
+static const char *tz_label(const char *rule) {
+  for (const TzOption &o : PORTAL_TZ)
+    if (strcmp(o.rule, rule) == 0) return o.label;
+  return rule;
+}
 
 static void html_escape(const char *in, String &out) {
   for (const char *p = in; *p; ++p) {
@@ -176,7 +238,7 @@ static String portal_ssid_options() {
 static void handle_root() {
   const bool sta_up = WiFi.status() == WL_CONNECTED;
   String b;
-  b.reserve(4096);
+  b.reserve(12288);
 
   // --- status ---
   b += F("<div class=c><h2>Status</h2><p>Wi-Fi: ");
@@ -193,6 +255,23 @@ static void handle_root() {
   b += g_cfg.has_client() ? F("<span class=ok>saved</span>") : F("<span class=bad>not set</span>");
   b += F("</p><p>Authorization: ");
   b += g_cfg.has_token() ? F("<span class=ok>done</span>") : F("<span class=bad>missing</span>");
+  b += F("</p><p>Clock: ");
+  {
+    const time_t t = time(nullptr);
+    if (clock_ready()) {
+      struct tm lt;
+      localtime_r(&t, &lt);
+      char when[48];
+      snprintf(when, sizeof(when), "%02d:%02d", lt.tm_hour, lt.tm_min);
+      b += F("<span class=ok>");
+      b += when;
+      b += F("</span> local (");
+      html_escape(tz_label(g_cfg.tz), b);
+      b += ')';
+    } else {
+      b += F("<span class=bad>not set yet</span> (needs the internet)");
+    }
+  }
   b += F("</p></div>");
 
   // --- step 1: Wi-Fi ---
@@ -242,6 +321,43 @@ static void handle_root() {
            "<button type=submit>Finish setup</button></form>");
   }
   b += F("</div>");
+
+  // --- night mode ---
+  b += F("<div class=c><h2>Night mode</h2><p>Between these hours the screen is off and the board asks Spotify "
+         "nothing at all. A touch wakes it for 30 seconds - longer if something is playing.</p>"
+         "<form method=POST action=/night><label><input type=checkbox name=non value=1 style='width:auto;margin-right:8px'");
+  if (g_cfg.night_on) b += F(" checked");
+  b += F(">Enable night mode</label>"
+         "<div class=row><div><label>From</label><select name=nstart>");
+  for (int h = 0; h < 24; ++h) {
+    char o[64];
+    snprintf(o, sizeof(o), "<option value=%d%s>%02d:00</option>", h, h == g_cfg.night_start ? " selected" : "", h);
+    b += o;
+  }
+  b += F("</select></div><div><label>To</label><select name=nend>");
+  for (int h = 0; h < 24; ++h) {
+    char o[64];
+    snprintf(o, sizeof(o), "<option value=%d%s>%02d:00</option>", h, h == g_cfg.night_end ? " selected" : "", h);
+    b += o;
+  }
+  b += F("</select></div></div><label>Time zone</label><select name=tz id=tz data-auto=");
+  // Untouched settings: let the browser pick the zone it is in.
+  b += (!g_cfg.night_on && strcmp(g_cfg.tz, CFG_TZ_DEFAULT) == 0) ? '1' : '0';
+  b += '>';
+  for (const TzOption &o : PORTAL_TZ) {
+    char head[120];
+    // The rules are ours, so they need no escaping; the labels go through html_escape.
+    snprintf(head, sizeof(head), "<option value='%s' data-o=%d data-d=%u%s>", o.rule, (int)o.std_min, (unsigned)o.dst,
+             strcmp(o.rule, g_cfg.tz) == 0 ? " selected" : "");
+    b += head;
+    html_escape(o.label, b);
+    b += F("</option>");
+  }
+  b += F("</select><button type=submit>Save night mode</button></form>"
+         "<script>(function(){var s=document.getElementById('tz');if(s.dataset.auto!='1')return;"
+         "var y=new Date().getFullYear(),a=-new Date(y,0,1).getTimezoneOffset(),b=-new Date(y,6,1).getTimezoneOffset(),"
+         "o=Math.min(a,b),d=a!=b?1:0;for(var i=0;i<s.options.length;i++){var t=s.options[i];"
+         "if(+t.dataset.o==o&&+t.dataset.d==d){s.selectedIndex=i;return}}})();</script></div>");
 
   // --- maintenance ---
   b += F("<div class=c><h2>Device</h2><form method=POST action=/restart><button class='btn btn2' type=submit>Restart</button></form>"
@@ -342,6 +458,53 @@ static void handle_save() {
     b += F("</div>");
   }
   portal_send_page(b, err[0] ? "Not saved" : (wifi_saved || client_saved) ? "Saved" : "Nothing to save");
+}
+
+static void handle_night() {
+  const bool on = g_http->arg("non").length() > 0;
+  const int start_h = g_http->arg("nstart").toInt();
+  const int end_h = g_http->arg("nend").toInt();
+  String tz = g_http->arg("tz");
+  tz.trim();
+  char err[140] = "";
+  g_portal_note[0] = 0;
+
+  if (start_h < 0 || start_h > 23 || end_h < 0 || end_h > 23)
+    strlcpy(err, "Pick a start and an end hour", sizeof(err));
+  else if (on && start_h == end_h)
+    strlcpy(err, "The start and end hours have to differ - otherwise the window is empty", sizeof(err));
+  else if (!tz.length() || !tz_is_known(tz.c_str()))
+    strlcpy(err, "Pick a time zone from the list", sizeof(err));
+
+  String b;
+  if (err[0]) {
+    b += F("<div class=c><p class=bad>");
+    html_escape(err, b);
+    b += F("</p><a class='btn btn2' href=/>Back</a></div>");
+    portal_send_page(b, "Not saved");
+    return;
+  }
+
+  const bool tz_changed = strcmp(tz.c_str(), g_cfg.tz) != 0;
+  config_save_night(on, start_h, end_h, tz.c_str());
+  if (tz_changed) clock_begin();  // re-read the time in the new zone straight away
+  snprintf(g_portal_note, sizeof(g_portal_note), "Night mode saved.");
+
+  b += F("<div class=c><p class=ok>Saved.</p>");
+  if (!on) {
+    b += F("<p>Night mode is off: the screen and the polling stay on around the clock.</p>");
+    view_set_status("Night mode off");
+  } else {
+    char line[160];
+    snprintf(line, sizeof(line), "<p>The screen goes off between %02d:00 and %02d:00.</p>", start_h, end_h);
+    b += line;
+    if (!clock_ready())
+      b += F("<p>The board has not got the time yet. It asks a time server as soon as it is online, and night "
+             "mode only starts once it has an answer.</p>");
+    view_set_status("Night mode saved");
+  }
+  b += F("<a class=btn href=/>Continue</a></div>");
+  portal_send_page(b, "Saved");
 }
 
 // Sends the phone to Spotify's consent page.
@@ -526,6 +689,7 @@ static void portal_start(PortalMode mode) {
     g_http = new WebServer(PORTAL_HTTP_PORT);
     g_http->on("/", handle_root);
     g_http->on("/save", HTTP_POST, handle_save);
+    g_http->on("/night", HTTP_POST, handle_night);
     g_http->on("/auth", handle_auth);
     g_http->on("/paste", HTTP_POST, handle_paste);
     g_http->on("/restart", HTTP_POST, handle_restart);

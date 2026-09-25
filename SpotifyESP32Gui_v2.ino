@@ -14,8 +14,11 @@
  * network and a setup page where you enter your Wi-Fi and your Spotify app,
  * then authorize it (see setup_portal.h for how the paste-back step works).
  * Everything is stored in NVS. Hold a finger on the screen for 5 seconds to
- * open that page again later. extras/get_refresh_token.py is still there if
- * you prefer doing the authorization on a PC and filling in secrets.h.
+ * reach that page again later; the same window carries the brightness slider.
+ * The page also has a night mode: between two hours of the local day the panel
+ * is off and nothing is polled (the board gets the time over SNTP).
+ * extras/get_refresh_token.py is still there if you prefer doing the
+ * authorization on a PC and filling in secrets.h.
  */
 
 // Serial logging: 0 = off, 1 = errors, 2 = + warnings, 3 = + info, 4 = + debug

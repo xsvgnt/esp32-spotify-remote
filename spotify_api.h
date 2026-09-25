@@ -35,6 +35,7 @@
 #include <esp_ota_ops.h>
 #include <esp_chip_info.h>
 #include <stdarg.h>
+#include <time.h>
 #include "secrets.h"
 
 // ============================================================================
@@ -305,6 +306,49 @@ static void wifi_begin() {
   LOGI("wifi", "connecting to \"%s\"", g_cfg.ssid);
   WiFi.begin(g_cfg.ssid, g_cfg.pass);
 }
+
+// ============================================================================
+// Clock (SNTP) - only needed by the night mode
+// ============================================================================
+// The RTC keeps no time across a power cut, so the clock starts unset and the
+// night window stays open until SNTP answers: a board that cannot reach a time
+// server behaves exactly as it did before night mode existed.
+#define CLOCK_VALID_AFTER 1735689600UL  // 2025-01-01, anything below is an unset clock
+#define CLOCK_RESYNC_MS   3600000UL     // how often the IDF's SNTP client refreshes
+
+static bool g_clock_ok = false;
+
+// Called whenever Wi-Fi comes up, and again if the time zone changes.
+static void clock_begin() {
+  LOGI("time", "SNTP starting, time zone %s", g_cfg.tz);
+  configTzTime(g_cfg.tz, "pool.ntp.org", "time.nist.gov");
+}
+
+// Cheap: reads the system clock, no network. Logs the first good reading.
+static bool clock_ready() {
+  const time_t now = time(nullptr);
+  if (now < (time_t)CLOCK_VALID_AFTER) return false;
+  if (!g_clock_ok) {
+    g_clock_ok = true;
+    struct tm lt;
+    localtime_r(&now, &lt);
+    LOGI("time", "clock set: %04d-%02d-%02d %02d:%02d:%02d local (%s)", lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday,
+         lt.tm_hour, lt.tm_min, lt.tm_sec, g_cfg.tz);
+  }
+  return true;
+}
+
+// -1 when the clock is not set yet.
+static int clock_local_hour() {
+  if (!clock_ready()) return -1;
+  const time_t now = time(nullptr);
+  struct tm lt;
+  localtime_r(&now, &lt);
+  return lt.tm_hour;
+}
+
+// True only when the clock is known AND the local hour is inside the window.
+static bool night_now() { return cfg_hour_in_night(g_cfg, clock_local_hour()); }
 
 // ============================================================================
 // API state (net_task only)
