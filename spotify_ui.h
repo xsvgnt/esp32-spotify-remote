@@ -898,31 +898,45 @@ static void poll_player() {
   if (!*id) id = item["uri"] | "";  // local files have a null id
   if (!*id) id = item["name"] | "";
 
+  // The title, the artists and the cover URL only change when the item does, so
+  // they are derived once per track instead of on every 3 s poll: an unchanged
+  // poll skips the UTF-8 folding, the artist join and the rendition scan, and
+  // leaves the shared strings alone.
+  const bool track_changed = strcmp(id, g_last_item) != 0;
   char title[128], artist[128], raw[256], cover[256];
-  fold_for_font(item["name"] | "", title, sizeof(title));
-  raw[0] = 0;
-  if (episode) {
-    strlcpy(raw, item["show"]["name"] | "", sizeof(raw));
-  } else {
-    for (JsonObjectConst a : item["artists"].as<JsonArrayConst>()) {
-      const char *nm = a["name"] | "";
-      if (!*nm) continue;
-      if (raw[0]) strlcat(raw, ", ", sizeof(raw));
-      strlcat(raw, nm, sizeof(raw));
+  title[0] = artist[0] = cover[0] = 0;
+  if (track_changed) {
+    fold_for_font(item["name"] | "", title, sizeof(title));
+    raw[0] = 0;
+    if (episode) {
+      strlcpy(raw, item["show"]["name"] | "", sizeof(raw));
+    } else {
+      for (JsonObjectConst a : item["artists"].as<JsonArrayConst>()) {
+        const char *nm = a["name"] | "";
+        if (!*nm) continue;
+        if (raw[0]) strlcat(raw, ", ", sizeof(raw));
+        strlcat(raw, nm, sizeof(raw));
+      }
     }
+    fold_for_font(raw, artist, sizeof(artist));
+    pick_cover(item, cover, sizeof(cover));
   }
-  fold_for_font(raw, artist, sizeof(artist));
-  pick_cover(item, cover, sizeof(cover));
   const uint32_t duration = item["duration_ms"] | 0;
 
   bool was_playing, kept_optimistic = false;
   ps_lock();
   was_playing = g_ps.playing;
   g_ps.has_item = true;
-  strlcpy(g_ps.item_id, id, sizeof(g_ps.item_id));
-  strlcpy(g_ps.title, title, sizeof(g_ps.title));
-  strlcpy(g_ps.artist, artist, sizeof(g_ps.artist));
-  strlcpy(g_ps.art_url, cover, sizeof(g_ps.art_url));
+  if (track_changed) {
+    strlcpy(g_ps.item_id, id, sizeof(g_ps.item_id));
+    strlcpy(g_ps.title, title, sizeof(g_ps.title));
+    strlcpy(g_ps.artist, artist, sizeof(g_ps.artist));
+    strlcpy(g_ps.art_url, cover, sizeof(g_ps.art_url));
+  } else {
+    // The retry check at the end of this function still needs the URL, and the
+    // artwork pipeline may have cleared g_art_tried asking to be run again.
+    strlcpy(cover, g_ps.art_url, sizeof(cover));
+  }
   g_ps.duration_ms = duration;
   if (g_ps.ui_seq == seq_at_start) {
     g_ps.playing = is_playing;
@@ -935,7 +949,6 @@ static void poll_player() {
 
   if (kept_optimistic) LOGD("poll", "result predates a tap - keeping the optimistic play/pause state");
 
-  const bool track_changed = strcmp(id, g_last_item) != 0;
   if (track_changed) {
     strlcpy(g_last_item, id, sizeof(g_last_item));
     LOGI("poll", "now %s: \"%s\" - %s (%lu s, %s) on \"%s\"", is_playing ? "playing" : "paused", title, artist,
