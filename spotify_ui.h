@@ -87,7 +87,8 @@
 #define NAV_BTN_X             118
 #define TAP_DISC_SIZE         76
 
-#define COLOR_SPOTIFY_GREEN   0x1DB954
+#define COLOR_SPOTIFY_GREEN   0x1DB954  // arc, slider, accents
+#define COLOR_SPOTIFY_LOGO    0x1ED760  // the mark's own green: logo_img.h holds only alpha
 #define COLOR_ARC_TRACK       0x202020
 #define COLOR_TEXT_GREY       0xB3B3B3
 
@@ -1564,7 +1565,9 @@ static void ui_build() {
 
   // Album art (lv_img over a PSRAM RGB565 buffer), centred on y = 58 + 75
   ui_art = lv_img_create(scr);
-  lv_img_set_src(ui_art, &logo_dsc);
+  lv_img_set_src(ui_art, &logo_dsc);  // an alpha mask - see logo_img.h
+  lv_obj_set_style_img_recolor(ui_art, lv_color_hex(COLOR_SPOTIFY_LOGO), 0);
+  lv_obj_set_style_img_recolor_opa(ui_art, LV_OPA_COVER, 0);
   lv_obj_align(ui_art, LV_ALIGN_CENTER, 0, ART_CENTER_OFS_Y);
   lv_obj_add_event_cb(ui_art, on_art_clicked, LV_EVENT_CLICKED, NULL);
   lv_obj_clear_flag(ui_art, LV_OBJ_FLAG_CLICKABLE);  // enabled in the track view
@@ -1735,6 +1738,9 @@ static void ui_tick(lv_timer_t *) {
   if (want_art != ui_art_state) {
     ui_art_state = want_art;
     lv_img_set_src(ui_art, want_art ? (const void *)&g_art_dsc : (const void *)&logo_dsc);
+    // logo_img.h is an alpha mask, so it needs a colour; cover art is a real
+    // image and must not be tinted, so the recolour is cleared for it.
+    lv_obj_set_style_img_recolor_opa(ui_art, want_art ? LV_OPA_TRANSP : LV_OPA_COVER, 0);
   } else if (art_changed && want_art) {
     lv_obj_invalidate(ui_art);
   }

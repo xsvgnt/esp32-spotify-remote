@@ -266,7 +266,7 @@ bold will stop the board working if they are wrong.
 | CPU Frequency | 240 MHz |
 | Upload Speed | 921600 |
 
-Then **Upload**. The build is about 1.55 MB, half of the 3 MB application
+Then **Upload**. The build is about 1.51 MB, half of the 3 MB application
 partition.
 
 > The pre-built image in the releases is built with **16M Flash (3MB APP/9.9MB
@@ -440,10 +440,36 @@ app_config.h               the NVS record: read, write, version, CRC
 setup_portal.h             the access point, the setup page, the paste-back flow
 scr_st77916.h              vendor panel bring-up, unmodified
 pincfg.h                   vendor pin map, unmodified
-logo_img.h                 the Spotify mark shown when nothing is playing
+logo_img.h                 the Spotify mark, stored as an alpha mask (see below)
 extras/lv_conf.h           the LVGL configuration described above
 docs/                      the screenshots in this README
 ```
+
+### The logo is an alpha mask, not a bitmap
+
+`logo_img.h` holds no colour. The mark is one colour on black with anti-aliased
+edges, so every pixel of the original RGB565 image was "brand green x alpha" -
+verified across all 78 colours it contained, with a worst deviation of 8/255,
+which is just RGB565 quantisation noise. Keeping only the alpha at 4 bits per
+pixel (`LV_IMG_CF_ALPHA_4BIT`) costs **12,800 bytes instead of 51,200**, saving
+38,400, and renders indistinguishably: measured against the original on a host
+build of LVGL, 3.7 % of screen pixels differ, by at most 12/255.
+
+Two consequences worth knowing before you touch it:
+
+- **It must be drawn with a recolour**, or it comes out black. `ui_build()` sets
+  `img_recolor` to `COLOR_SPOTIFY_LOGO`, and `ui_tick()` clears `img_recolor_opa`
+  whenever that same image object switches to cover art - real artwork must not
+  be tinted. The host render tests cover this: the cover-art screens stay
+  byte-identical.
+- **The black bands inside the mark are transparent**, not black. They look right
+  only because the screen behind them is black.
+
+Replacing the mark with a multi-colour image means switching the descriptor back
+to `LV_IMG_CF_TRUE_COLOR` and dropping the two recolour lines.
+
+Incidentally, the mark's own green is `#1ED760`, Spotify's current brand colour,
+while the arc and slider use `#1DB954`, the older one - hence the two constants.
 
 ---
 
