@@ -45,6 +45,16 @@
 #if !LV_FONT_MONTSERRAT_14 || !LV_FONT_MONTSERRAT_16 || !LV_FONT_MONTSERRAT_22 || !LV_FONT_MONTSERRAT_32
 #error "lv_conf.h: enable LV_FONT_MONTSERRAT_14, _16, _22 and _32"
 #endif
+// extras/lv_conf.h prunes every widget this UI does not use (49 KB of flash).
+// These are the ones it does use, including the dependencies that are easy to
+// miss: MSGBOX needs BTNMATRIX and LABEL, SLIDER needs BAR, QRCODE needs CANVAS.
+#if !LV_USE_ARC || !LV_USE_BAR || !LV_USE_BTN || !LV_USE_BTNMATRIX || !LV_USE_CANVAS || \
+    !LV_USE_IMG || !LV_USE_LABEL || !LV_USE_MSGBOX || !LV_USE_SLIDER || !LV_USE_FLEX || !LV_USE_THEME_DEFAULT
+#error "lv_conf.h: this UI needs LV_USE_ARC, BAR, BTN, BTNMATRIX, CANVAS, IMG, LABEL, MSGBOX, SLIDER, FLEX, THEME_DEFAULT"
+#endif
+#if !LV_USE_QRCODE
+#warning "lv_conf.h: LV_USE_QRCODE is 0 - the setup screens will show their text without a QR code"
+#endif
 #if LV_USE_PERF_MONITOR || LV_USE_MEM_MONITOR
 #warning "lv_conf.h: LV_USE_PERF_MONITOR / LV_USE_MEM_MONITOR should be 0"
 #endif

@@ -1,8 +1,28 @@
 # esp32-spotify-remote
 
-A Spotify remote for a 1.8" round 360×360 touchscreen (ESP32-S3,
-JC3636W518EN class bought from Aliexpress) powered by USB-C, built with Claude AI. It shows the current track with its cover art and a
+A Spotify remote for a 1.8" round 360×360 touchscreen built with Claude AI. It shows the current track with its cover art and a
 progress ring, and lets you play, pause and skip by touching the screen.
+
+Name of the device used: 1.8-Inch Round Screen QSPI 360 * 360 IPS Display ESP32-S3 8M PSRAM 16M FLASH Secondary Screen AIDA64 Pickup Spectrum Electronic.
+https://aliexpress.com/item/1005007606734344.html
+
+| Name | Description |
+|---|---|
+| Display color | RGB 262K color |
+| SKU | JC3636W518C_I_Y |
+| Size | 1.8 inch |
+| Type | TFT |
+| Driver chip | ST77916 CST816（touch） |
+| Resolution | 360 * 360(Pixel) |
+| Effective display area | 45.68 * 45.68(mm) |
+| Module size | 58 * 58 * 11(mm) |
+| View | IPS |
+| Operating temperature | -20℃~70℃ |
+| Storage temperature | -30℃~80℃ |
+| Operating Voltage | 5V |
+| Power consumption | About 180mA |
+| Product weight | About 50g |
+
 
 It talks to the Spotify Web API directly over HTTPS — no third-party Spotify
 library, no cloud service of ours in between, nothing but your board and
@@ -10,10 +30,9 @@ library, no cloud service of ours in between, nothing but your board and
 
 ![The player, the idle screen, the settings dialog and the first-boot setup screen](docs/screens.png)
 
-**Nothing is compiled in.** No credentials live in the source, so the same
-binary works for anybody: a freshly flashed board opens its own Wi-Fi network
-and walks you through setup from your phone. That is also why a
-[pre-built image](#option-a--flash-the-pre-built-image) can be published at all.
+**No credentials are compiled in.** The same
+[binary](#option-a--flash-the-pre-built-image) works for anybody: a freshly flashed board opens its own Wi-Fi network
+and walks you through setup from your phone.
 
 ---
 
@@ -41,26 +60,17 @@ once and a translucent ▶/❚❚ disc confirms it, without waiting for the netw
 
 <img src="docs/screen-player.png" width="260" alt="The player screen">
 
-**Navigation**  ·  ⏮ and ⏭ either side of the artwork, with 64-pixel round touch
-areas so they are comfortable on a small round panel. Covers for the next track
+**Navigation**  ·  ⏮ and ⏭ either side of the artwork. Covers for the next track
 are fetched ahead of time, so skipping usually shows the new artwork instantly.
 
 **Brightness**  ·  Hold a finger anywhere on the screen for 5 seconds. A window
-opens with a slider from 10 % to 100 % in steps of 10. The panel follows the
-slider as you drag it; the value reaches flash when you lift your finger, so one
-adjustment is one write. The screen still dims to 10 % after 10 idle seconds
+opens with a slider from 10 % to 100 %. The screen still dims to 10 % after 10 seconds
 when nothing is playing, and comes straight back on a touch.
 
 <img src="docs/screen-settings.png" width="260" alt="The settings window with the brightness slider">
 
 **Night mode**  ·  Pick two hours on the setup page and between them the screen
-is off and the board asks Spotify nothing at all — no polling, no artwork, no
-token refresh, and the TLS session is closed. A touch wakes it for 30 seconds;
-if something is playing that keeps rolling forward, so it goes back to sleep
-30 seconds after playback stops. The window may cross midnight (23:00 → 07:00).
-The board learns the time over SNTP, and until it has an answer it never counts
-anything as night — a board that cannot reach a time server simply behaves as if
-night mode were off.
+is off and the board doesn't send requests to Spotify. A touch wakes it for 30 seconds, as long as something is playing.
 
 <img src="docs/setup-night.png" width="340" alt="The night mode card on the setup page">
 
@@ -195,6 +205,49 @@ which the firmware depends on:
 If you already have an `lv_conf.h` for another project, merge these settings
 rather than overwriting it.
 
+#### Unused widgets are pruned on purpose
+
+The supplied `lv_conf.h` also sets **26 `LV_USE_*` widget flags to 0** — every
+widget this firmware never instantiates: animimg, calendar, chart, checkbox,
+colorwheel, dropdown, grid, imgbtn, keyboard, led, line, list, menu, meter,
+roller, span, spinbox, spinner, switch, table, tabview, textarea, tileview, win,
+theme_basic and theme_mono.
+
+That is worth **49 KB of flash — 1,601,577 → 1,551,345 bytes**, and it is not
+the no-op you would expect from a build that already uses `-ffunction-sections`
+and `--gc-sections`. `lv_theme_default.c` applies its styles through about 52
+`lv_obj_check_type(obj, &lv_xxx_class)` tests, one per *enabled* widget. Each
+test references that widget's class, which references its constructor and event
+handler, which drags in the whole translation unit — so an enabled-but-unused
+widget stays reachable and survives garbage collection. Switching the flag off
+removes the reference before the compiler ever sees it.
+
+The UI was re-rendered against a host build of LVGL with this configuration and
+all ten screens came out byte-identical, so nothing is given up.
+
+**If you extend the UI, re-enable what you need** — and watch the dependencies:
+
+| Kept | Because |
+|---|---|
+| `ARC` | the progress ring |
+| `BAR` | **required by** `SLIDER` |
+| `BTN` | the previous / next touch targets |
+| `BTNMATRIX` | **required by** `MSGBOX` |
+| `CANVAS` | **required by** `QRCODE` |
+| `IMG` | cover art and the logo; also required by `CANVAS` |
+| `LABEL` | all text; also required by `MSGBOX` |
+| `MSGBOX` | the settings window |
+| `SLIDER` | the brightness control |
+| `QRCODE` | the setup screens |
+| `FLEX` | lays out the settings window |
+| `THEME_DEFAULT` | the only theme used |
+
+`spotify_ui.h` checks this list at compile time, so a wrong or stock `lv_conf.h`
+stops with `#error "lv_conf.h: this UI needs LV_USE_ARC, BAR, BTN, …"` instead
+of a page of undefined references. `LV_USE_QRCODE` is the one soft dependency:
+turn it off and you get a warning, and the setup screens show their text without
+a QR code.
+
 ### 4. Tools menu
 
 Open `esp32-spotify-remote.ino` and set **Tools** exactly as follows. The ones in
@@ -213,7 +266,7 @@ bold will stop the board working if they are wrong.
 | CPU Frequency | 240 MHz |
 | Upload Speed | 921600 |
 
-Then **Upload**. The build is about 1.6 MB, half of the 3 MB application
+Then **Upload**. The build is about 1.55 MB, half of the 3 MB application
 partition.
 
 > The pre-built image in the releases is built with **16M Flash (3MB APP/9.9MB
@@ -248,8 +301,7 @@ network when scanned with a phone camera.
 
 <img src="docs/screen-setup-ap.png" width="260" alt="The setup screen showing the access point name, password and QR code">
 
-Join it, then open **http://192.168.4.1** — the address is on the screen too.
-Most phones offer the page by themselves, as a captive portal.
+Join it, then open **http://192.168.4.1** — the address is on the screen too, some  phones offer the page by themselves as a captive portal. You might also have a warning displayed, because no internet connexion is provided.
 
 ### 2. Enter your Wi-Fi
 
@@ -257,7 +309,7 @@ Most phones offer the page by themselves, as a captive portal.
 
 Pick your network from the list (the board scans while the page is open) and
 type its password, then **Save Wi-Fi**. The board tries the credentials before
-storing them, so a typo cannot lock you out — it tells you instead.
+storing them.
 
 ### 3. Create your Spotify app
 
