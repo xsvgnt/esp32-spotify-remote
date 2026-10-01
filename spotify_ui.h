@@ -115,6 +115,8 @@
 
 #define POLL_INTERVAL_MS      3000
 #define POLL_MAX_INTERVAL_MS  30000   // after repeated failures
+#define POLL_AIM_MARGIN_MS    300     // poll this long after a track is due to end
+#define POLL_MIN_INTERVAL_MS  1000    // never two polls closer than this
 #define CMD_SETTLE_MS         500     // re-read state this long after a command
 #define STAGE_WAIT_MS         1500
 #define BAD_URL_MEMORY_MS     600000  // a failed cover URL is not retried for 10 min
@@ -835,6 +837,17 @@ static void on_poll_error(const ApiResult &r) {
   }
 }
 
+// Every exit from poll_player() goes through this. A request that took longer
+// than the interval would otherwise leave g_next_poll in the past, and the next
+// loop iteration would fire another one 20 ms later: on a weak link, where a
+// request can burn 8 s on a read timeout plus 10 s on a TCP connect, that turns
+// into back-to-back TLS handshakes with no idle time at all. Each one wants
+// 40-50 KB in a single block, so the heap fragments until nothing fits.
+static void set_next_poll(uint32_t at) {
+  const uint32_t floor_at = millis() + POLL_MIN_INTERVAL_MS;
+  g_next_poll = ((int32_t)(at - floor_at) < 0) ? floor_at : at;
+}
+
 static void poll_player() {
   static char path[96] = "";
   if (!path[0])
@@ -854,11 +867,11 @@ static void poll_player() {
     if (is_connectivity_error(r.status)) conn_mark_bad();
     on_poll_error(r);
     uint32_t wait = 0;
-    if (api_in_backoff(&wait)) g_next_poll = millis() + max<uint32_t>(wait, POLL_INTERVAL_MS);
-    else g_next_poll = millis() + min<uint32_t>(POLL_INTERVAL_MS << min<uint32_t>(g_poll_failures, 4), POLL_MAX_INTERVAL_MS);
+    if (api_in_backoff(&wait)) set_next_poll(millis() + max<uint32_t>(wait, POLL_INTERVAL_MS));
+    else set_next_poll(millis() + min<uint32_t>(POLL_INTERVAL_MS << min<uint32_t>(g_poll_failures, 4), POLL_MAX_INTERVAL_MS));
     return;
   }
-  g_next_poll = t_start + POLL_INTERVAL_MS;
+  set_next_poll(t_start + POLL_INTERVAL_MS);  // the early returns below keep this
   conn_mark_good();
   if (g_poll_failures || g_last_poll_error[0]) LOGI("poll", "recovered after %lu failure(s)", (unsigned long)g_poll_failures);
   g_poll_failures = 0;
@@ -959,6 +972,24 @@ static void poll_player() {
     LOGI("poll", "%s", is_playing ? "resumed" : "paused");
   }
   if (cover[0] && strcmp(cover, g_art_tried) != 0) g_art_pending = true;  // cover not attempted yet
+
+  // Aim the next poll at the moment this track is due to end, rather than
+  // polling faster for the whole song: the answer can only change at one
+  // instant and /me/player says when that is. One well-placed request instead
+  // of several, and the screen follows a track change within a few hundred ms.
+  //
+  // The prediction is wrong when a track is cut short (a continuous DJ mix), on
+  // crossfade, and on a manual skip - all of which the normal cadence catches,
+  // exactly as before. It can also overshoot, which is what the floor is for:
+  // a duration that never arrives degrades to one poll a second, not a spin.
+  if (is_playing && duration && !kept_optimistic) {
+    const uint32_t remaining = duration > progress ? duration - progress : 0;
+    const uint32_t aimed = sampled_at + remaining + POLL_AIM_MARGIN_MS;
+    if ((int32_t)(aimed - g_next_poll) < 0) {
+      set_next_poll(aimed);
+      LOGD("poll", "track ends in %lu ms - aiming the next poll at it", (unsigned long)remaining);
+    }
+  }
 }
 
 static void revert_optimistic(CmdType t) {

@@ -1,1 +1,1 @@
-4d98a22096fbb5c436b6e01328781acfd620a10a464c28ac35fb2ae904a413b4  esp32-spotify-remote-1.0.0.bin
+c9e7cead4ebbaf8c149bcf7d4a021533bf1a4dd10f14509f34d21b5a5946d2ae  esp32-spotify-remote-1.0.0.bin
